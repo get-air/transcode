@@ -4,7 +4,7 @@
 
 The installed Stremio server and its current bundled HLS v2 behavior were inspected as an interoperability reference. Its externally observable model informed the requirements: finite probing, complete VOD playlists, independent tracks, lazy fragments, direct remuxing, keyframe-aware seeking, cancellation, bounded cache state, and hardware fallback. No Stremio source is included or called at runtime.
 
-The implementation deliberately uses GStreamer for every media operation. Rust owns HTTP, validation, scheduling, cache policy, and lifecycle.
+The implementation deliberately uses GStreamer for every media operation. Rust owns HTTP, validation, scheduling, cache policy, lifecycle, and ISO BMFF boundary validation. A two-stage appsink/appsrc bridge buffers only the already encoded bounded track interval, allowing normal source seeking before CMAF muxing.
 
 ## Request flow
 
@@ -22,7 +22,10 @@ segment request
   -> acquire global pipeline permit
   -> seek remote source to bounded interval
   -> parse/remux OR decode/convert/encode
-  -> hlscmafsink/cmafmux
+  -> appsink encoded buffers
+  -> normalize local timestamps
+  -> appsrc -> cmafmux -> filesink
+  -> split complete CMAF into init + media sections
   -> apply global tfdt decode-time offset
   -> validate ftyp/moov or styp/moof/tfdt/mdat
   -> atomically expose cache artifact
@@ -36,7 +39,7 @@ Encoder selection is registry-driven rather than operating-system-name-driven. F
 
 ## Concurrency and cancellation
 
-A Tokio semaphore bounds native pipelines. A per-session/track/sequence mutex prevents duplicate work. Requests more than two segments away cancel older work for that track; cancellation is checked during preroll, state transitions, encoder fallback, and bus waits. Dropping the HTTP future also cancels its GStreamer task.
+A Tokio semaphore bounds native pipelines. A per-session/track/sequence mutex prevents duplicate work. Requests more than two segments away cancel older work for that track; cancellation is checked during preroll, state transitions, encoder fallback, and bus waits. All encoder attempts share one total deadline rather than multiplying the timeout by the number of candidates. HTTP client disconnect detection still needs an explicit job/lease protocol because Hyper can keep the service future alive after the socket closes.
 
 ## Cache integrity
 
@@ -45,4 +48,3 @@ Each segment has a private generation directory. Cached artifacts are parsed bef
 ## Known hard problem: arbitrary-keyframe transmux maps
 
 Independent range-seek transmuxing must use real source keyframe boundaries. A fixed four-second timeline is exact only when keyframes align with those boundaries. The release design requires a GStreamer-backed byte-range reader plus MP4/Matroska index extraction, or an equivalent GStreamer index API, before arbitrary-keyframe sources can be advertised as exact direct transmux. Until then this is a documented release gate and is covered by adversarial fixture work rather than hidden behind optimistic metadata.
-

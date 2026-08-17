@@ -11,7 +11,7 @@ use std::{
 
 use air_transcode::{
     AppState, Config, app,
-    mp4::{decode_time, validate_init_segment, validate_media_segment},
+    mp4::{decode_time, media_data, validate_init_segment, validate_media_segment},
 };
 use axum::{
     Router,
@@ -102,6 +102,7 @@ async fn remote_http_transmux_is_seekable_deduplicated_and_playable() -> TestRes
     validate_init_segment(&init)?;
     validate_media_segment(&segment_one)?;
     assert_eq!(decode_time(&segment_one), Some(0));
+    assert!(media_data(&segment_one) != media_data(&responses[0]));
     assert!(origin_state.range_requests.load(Ordering::Relaxed) > 0);
 
     let cached_segment = cache
@@ -253,7 +254,8 @@ async fn create_session(
             "source": {
                 "url": format!("{origin_url}/media"),
                 "headers": { "Authorization": "Bearer fixture" }
-            }
+            },
+            "output": { "max_width": 1920 }
         }))
         .send()
         .await?
@@ -263,14 +265,17 @@ async fn create_session(
 }
 
 async fn fetch_bytes(client: &reqwest::Client, url: String) -> TestResult<Vec<u8>> {
-    Ok(client
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?
-        .to_vec())
+    let response = client.get(url).send().await?;
+    let status = response.status();
+    let body = response.bytes().await?;
+    if !status.is_success() {
+        return Err(io::Error::other(format!(
+            "segment request failed with {status}: {}",
+            String::from_utf8_lossy(&body)
+        ))
+        .into());
+    }
+    Ok(body.to_vec())
 }
 
 fn json_string<'a>(value: &'a Value, key: &str) -> TestResult<&'a str> {
@@ -365,20 +370,20 @@ enum FixtureKind {
 fn generate_fixture(path: &Path, kind: FixtureKind) -> TestResult {
     let mux_and_video = match kind {
         FixtureKind::H264Aac => format!(
-            "mp4mux name=mux ! filesink location={} videotestsrc num-buffers=90 pattern=zone-plate ! video/x-raw,format=I420,width=320,height=180,framerate=30/1 ! x264enc speed-preset=ultrafast tune=zerolatency key-int-max=30 bframes=0 byte-stream=false ! h264parse ! queue ! mux.",
+            "mp4mux name=mux ! filesink location={} videotestsrc num-buffers=180 pattern=smpte horizontal-speed=3 ! video/x-raw,format=I420,width=320,height=180,framerate=30/1 ! x264enc speed-preset=ultrafast tune=zerolatency key-int-max=30 bframes=0 byte-stream=false ! h264parse ! queue ! mux.",
             path.display()
         ),
         FixtureKind::Vp9Opus => format!(
-            "matroskamux name=mux ! filesink location={} videotestsrc num-buffers=90 pattern=ball ! video/x-raw,width=320,height=180,framerate=30/1 ! vp9enc deadline=1 keyframe-max-dist=30 ! queue ! mux.",
+            "matroskamux name=mux ! filesink location={} videotestsrc num-buffers=180 pattern=ball animation-mode=frames ! video/x-raw,width=320,height=180,framerate=30/1 ! vp9enc deadline=1 keyframe-max-dist=30 ! queue ! mux.",
             path.display()
         ),
     };
     let audio = match kind {
         FixtureKind::H264Aac => {
-            "audiotestsrc num-buffers=142 wave=white-noise ! audio/x-raw,rate=48000,channels=2 ! avenc_aac ! aacparse ! queue ! mux."
+            "audiotestsrc num-buffers=282 wave=white-noise ! audio/x-raw,rate=48000,channels=2 ! avenc_aac ! aacparse ! queue ! mux."
         }
         FixtureKind::Vp9Opus => {
-            "audiotestsrc num-buffers=142 wave=ticks ! audio/x-raw,rate=48000,channels=2 ! opusenc ! queue ! mux."
+            "audiotestsrc num-buffers=282 wave=ticks ! audio/x-raw,rate=48000,channels=2 ! opusenc ! queue ! mux."
         }
     };
     run_pipeline(&format!("{mux_and_video} {audio}"), Duration::from_secs(20))

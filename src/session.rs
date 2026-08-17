@@ -44,6 +44,7 @@ pub struct Source {
 pub struct OutputOptions {
     #[serde(default = "default_true")]
     pub transmux: bool,
+    #[serde(default)]
     pub force_transcode: bool,
     #[serde(default = "default_max_width")]
     pub max_width: u32,

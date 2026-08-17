@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BoxHeader {
+    start: usize,
     kind: [u8; 4],
     payload_start: usize,
     end: usize,
@@ -55,6 +56,40 @@ pub fn validate_media_segment(data: &[u8]) -> Result<()> {
 #[must_use]
 pub fn decode_time(data: &[u8]) -> Option<u64> {
     find_tfdt(data, 0, data.len(), 0)
+}
+
+/// Returns the media payload from the first top-level `mdat` box.
+#[must_use]
+pub fn media_data(data: &[u8]) -> Option<&[u8]> {
+    top_level_boxes(data)
+        .ok()?
+        .into_iter()
+        .find(|header| header.kind == *b"mdat")
+        .and_then(|header| data.get(header.payload_start..header.end))
+}
+
+/// Splits a complete CMAF file into its initialization and media sections.
+///
+/// # Errors
+///
+/// Returns an error when the file is malformed or does not contain a media
+/// section beginning with `styp` or `moof`.
+pub fn split_cmaf(data: &[u8]) -> Result<(&[u8], &[u8])> {
+    let boxes = top_level_boxes(data)?;
+    let media_start = boxes
+        .iter()
+        .find(|header| matches!(&header.kind, b"styp" | b"moof"))
+        .map(|header| header.start)
+        .ok_or_else(|| Error::Pipeline("generated CMAF file has no media section".to_owned()))?;
+    let init = data
+        .get(..media_start)
+        .ok_or_else(|| Error::Pipeline("invalid CMAF initialization range".to_owned()))?;
+    let media = data
+        .get(media_start..)
+        .ok_or_else(|| Error::Pipeline("invalid CMAF media range".to_owned()))?;
+    validate_init_segment(init)?;
+    validate_media_segment(media)?;
+    Ok((init, media))
 }
 
 fn find_tfdt(data: &[u8], start: usize, end: usize, depth: u8) -> Option<u64> {
@@ -132,6 +167,7 @@ fn parse_header(data: &[u8], start: usize, limit: usize) -> std::result::Result<
         return Err("truncated ISO BMFF box payload".to_owned());
     }
     Ok(BoxHeader {
+        start,
         kind,
         payload_start: start + header_size,
         end,
@@ -167,6 +203,8 @@ mod tests {
             let _ = validate_init_segment(&data);
             let _ = validate_media_segment(&data);
             let _ = decode_time(&data);
+            let _ = media_data(&data);
+            let _ = split_cmaf(&data);
         }
     }
 }

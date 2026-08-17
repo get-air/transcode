@@ -26,6 +26,13 @@
 - Property tests against arbitrary malformed ISO BMFF input.
 - Two-hour manifest generation benchmark.
 
+## Real remote 2160p results
+
+Two signed remote Matroska sources were exercised without persisting their URLs:
+
+- 3840×2160 HEVC with four stereo AAC tracks: full-duration probing, segment 1 and segment 700 random access, AAC transmux, HEVC-to-1920×1080 H.264 conversion, distinct media-payload validation, and complete HLS discovery passed. On the test RX 7900 XT host, four seconds of video took approximately 4.3–4.7 seconds after pipeline startup.
+- 3840×1600 Dolby Vision/HDR10+ Main-10 HEVC with ten 5.1 E-AC-3 tracks: duration and all tracks probe correctly, and GStreamer negotiates `vah265dec -> vapostproc -> vah264enc`. It still produces fewer than 96 frames in 30 seconds on the same host and is therefore a failed performance case, not claimed compatibility.
+
 ## Platform intent
 
 | Platform | GStreamer transport | Preferred hardware path | Software fallback |
@@ -39,10 +46,11 @@ Factory discovery is caps-based, so the server does not depend on a hard-coded A
 ## Gates before a stable release
 
 - Exact MP4 and Matroska keyframe maps for arbitrary-GOP direct transmuxing.
+- Color-correct Dolby Vision/HDR10/HDR10+ to SDR tone mapping. Eight-bit conversion without tone mapping is not considered visually correct.
+- Explicit segment job leases so abandoned HTTP requests cancel immediately after a client disconnect.
 - Multiple selectable video/audio/subtitle renditions.
 - WebVTT conversion and subtitle playlists.
 - GStreamer Android distribution packaging and on-device MediaCodec tests.
 - Windows runner tests against official MSVC GStreamer binaries.
 - Chromium, Firefox, WebKit, Android WebView, and Safari/hls.js playback automation.
 - Sustained 4K concurrency, memory, cancellation latency, and cache-pressure benchmarks.
-

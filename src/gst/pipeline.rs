@@ -2,11 +2,14 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
+use gstreamer_app as gst_app;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -14,7 +17,7 @@ use url::Url;
 use crate::{
     error::{Error, Result},
     hls::{SegmentSpec, TrackKind},
-    mp4::{validate_init_segment, validate_media_segment},
+    mp4::{split_cmaf, validate_init_segment, validate_media_segment},
 };
 
 use super::capabilities::encoder_candidates;
@@ -69,6 +72,7 @@ pub fn generate_segment(request: &SegmentRequest) -> Result<SegmentArtifact> {
     }
     let mut failures = Vec::new();
     let mut first_attempt = true;
+    let deadline = std::time::Instant::now() + request.timeout;
     for candidate in candidates {
         if request.cancellation.is_cancelled() {
             return Err(Error::Cancelled);
@@ -78,7 +82,13 @@ pub fn generate_segment(request: &SegmentRequest) -> Result<SegmentArtifact> {
         } else {
             cleanup_attempt_files(&request.output_dir)?;
         }
-        match generate_segment_once(request, Some(&candidate.element)) {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let mut attempt = request.clone();
+        attempt.timeout = remaining;
+        match generate_segment_once(&attempt, Some(&candidate.element)) {
             Ok(artifact) => return Ok(artifact),
             Err(error) => failures.push(format!("{}: {error}", candidate.element)),
         }
@@ -97,8 +107,7 @@ fn generate_segment_once(
     fs::create_dir_all(&request.output_dir)?;
     let init_path = request.output_dir.join("init.mp4");
     let segment_path = request.output_dir.join("segment.m4s");
-    let init_pattern = request.output_dir.join("init%05d.mp4");
-    let segment_pattern = request.output_dir.join("segment%05d.m4s");
+    let combined_path = request.output_dir.join("combined.mp4");
     if init_path.is_file() && segment_path.is_file() {
         let valid = fs::read(&init_path)
             .ok()
@@ -122,54 +131,41 @@ fn generate_segment_once(
 
     let pipeline = gst::Pipeline::with_name("air-transcode-segment");
     let _pipeline_cleanup = PipelineCleanup(pipeline.clone());
-    let desired_caps = match (request.track, request.mode) {
-        (TrackKind::Video, PipelineMode::Transmux) => gst::Caps::builder("video/x-h264").build(),
-        (TrackKind::Audio, PipelineMode::Transmux) => gst::Caps::builder("audio/mpeg")
+    let va_memory = matches!(request.track, TrackKind::Video)
+        && matches!(request.mode, PipelineMode::Transcode)
+        && encoder_name.is_some_and(|name| name.starts_with("va"))
+        && gst::ElementFactory::find("vapostproc").is_some();
+    let desired_caps = match (request.track, request.mode, va_memory) {
+        (TrackKind::Video, PipelineMode::Transmux, _) => gst::Caps::builder("video/x-h264").build(),
+        (TrackKind::Audio, PipelineMode::Transmux, _) => gst::Caps::builder("audio/mpeg")
             .field("mpegversion", 4_i32)
             .build(),
-        (TrackKind::Video, PipelineMode::Transcode) => gst::Caps::builder("video/x-raw").build(),
-        (TrackKind::Audio, PipelineMode::Transcode) => gst::Caps::builder("audio/x-raw").build(),
+        (TrackKind::Video, PipelineMode::Transcode, true) => {
+            gst::Caps::builder("video/x-raw").any_features().build()
+        }
+        (TrackKind::Video, PipelineMode::Transcode, false) => {
+            gst::Caps::builder("video/x-raw").build()
+        }
+        (TrackKind::Audio, PipelineMode::Transcode, _) => gst::Caps::builder("audio/x-raw").build(),
     };
     let source = gst::ElementFactory::make("uridecodebin")
         .name("source")
         .property("uri", request.source.as_str())
         .property("caps", &desired_caps)
+        .property("expose-all-streams", false)
         .build()
         .map_err(|_| Error::MissingElement("uridecodebin".to_owned()))?;
     configure_source_headers(&source, request.headers.clone());
     let queue = make("queue")?;
-    let sink = gst::ElementFactory::make("hlscmafsink")
-        .name("sink")
-        .property(
-            "target-duration",
-            u32::try_from(request.segment.duration_ns.div_ceil(1_000_000_000)).unwrap_or(u32::MAX),
-        )
-        .property("playlist-length", 0_u32)
-        .property("max-files", 0_u32)
-        .property("sync", true)
-        .property("init-location", init_pattern.to_string_lossy().as_ref())
-        .property("location", segment_pattern.to_string_lossy().as_ref())
-        .property(
-            "playlist-location",
-            request
-                .output_dir
-                .join("generated.m3u8")
-                .to_string_lossy()
-                .as_ref(),
-        )
+    let app_sink = gst::ElementFactory::make("appsink")
+        .name("encoded-sink")
+        .property("sync", false)
+        .property("max-buffers", 128_u32)
         .build()
-        .map_err(|_| Error::MissingElement("hlscmafsink".to_owned()))?;
-    sink.set_property_from_str("playlist-type", "vod");
-    let muxer = sink
-        .clone()
-        .downcast::<gst::Bin>()
-        .ok()
-        .and_then(|bin| bin.by_name("muxer"))
-        .ok_or_else(|| Error::Pipeline("hlscmafsink has no CMAF muxer child".to_owned()))?;
-    muxer.set_property(
-        "decode-time-offset",
-        i64::try_from(request.segment.start_ns).unwrap_or(i64::MAX),
-    );
+        .map_err(|_| Error::MissingElement("appsink".to_owned()))?
+        .downcast::<gst_app::AppSink>()
+        .map_err(|_| Error::Pipeline("appsink has an unexpected type".to_owned()))?;
+    let app_sink_element = app_sink.clone().upcast::<gst::Element>();
 
     pipeline
         .add_many([&source, &queue])
@@ -186,26 +182,28 @@ fn generate_segment_once(
             .map_err(|error| Error::Pipeline(error.to_string()))?;
     }
     pipeline
-        .add(&sink)
+        .add(&app_sink_element)
         .map_err(|error| Error::Pipeline(error.to_string()))?;
 
     let mut elements: Vec<&gst::Element> = Vec::with_capacity(chain.len() + 2);
     elements.push(&queue);
     elements.extend(chain.iter());
-    elements.push(&sink);
+    elements.push(&app_sink_element);
     gst::Element::link_many(&elements).map_err(|error| Error::Pipeline(error.to_string()))?;
 
     let queue_sink = queue
         .static_pad("sink")
         .ok_or_else(|| Error::Pipeline("queue has no sink pad".to_owned()))?;
     let desired_for_pad = desired_caps;
+    let linked_source_pad = Arc::new(Mutex::new(None::<gst::Pad>));
+    let linked_source_pad_callback = Arc::clone(&linked_source_pad);
     source.connect_pad_added(move |_, pad| {
         if queue_sink.is_linked() {
             return;
         }
         let caps = pad.current_caps().unwrap_or_else(|| pad.query_caps(None));
-        if caps.can_intersect(&desired_for_pad) {
-            let _ = pad.link(&queue_sink);
+        if caps.can_intersect(&desired_for_pad) && pad.link(&queue_sink).is_ok() {
+            *linked_source_pad_callback.lock() = Some(pad.clone());
         }
     });
 
@@ -219,16 +217,6 @@ fn generate_segment_once(
         &request.cancellation,
     )?;
 
-    pipeline
-        .set_state(gst::State::Playing)
-        .map_err(|error| Error::Pipeline(error.to_string()))?;
-    wait_for_state(
-        &pipeline,
-        gst::State::Playing,
-        request.timeout,
-        &request.cancellation,
-    )?;
-
     let start = gst::ClockTime::from_nseconds(request.segment.start_ns);
     let stop =
         gst::ClockTime::from_nseconds(request.segment.start_ns + request.segment.duration_ns);
@@ -236,32 +224,49 @@ fn generate_segment_once(
         PipelineMode::Transmux => gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
         PipelineMode::Transcode => gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
     };
-    let seek_result = source.seek(
-        1.0,
-        flags,
-        gst::SeekType::Set,
-        start,
-        gst::SeekType::Set,
-        stop,
-    );
-    if seek_result.is_err() {
+    let seek_pad = linked_source_pad.lock().clone().ok_or_else(|| {
+        Error::Pipeline("source did not expose the selected track pad".to_owned())
+    })?;
+    let seek_result = pipeline
+        .seek(
+            1.0,
+            flags,
+            gst::SeekType::Set,
+            start,
+            gst::SeekType::Set,
+            stop,
+        )
+        .is_ok()
+        || seek_pad.send_event(gst::event::Seek::new(
+            1.0,
+            flags,
+            gst::SeekType::Set,
+            start,
+            gst::SeekType::Set,
+            stop,
+        ));
+    if !seek_result {
         let (_, current, pending) = pipeline.state(gst::ClockTime::ZERO);
         return Err(Error::Pipeline(format!(
             "source rejected segment seek; current={current:?}; pending={pending:?}"
         )));
     }
-    sink.set_property("sync", false);
+    pipeline
+        .set_state(gst::State::Playing)
+        .map_err(|error| Error::Pipeline(error.to_string()))?;
 
-    let result = wait_for_pipeline(&pipeline, request.timeout, &request.cancellation);
+    let encoded =
+        collect_encoded_track(&pipeline, &app_sink, request.timeout, &request.cancellation);
     let _ = pipeline.set_state(gst::State::Null);
-    result?;
+    let encoded = encoded?;
 
-    normalize_generated_paths(&request.output_dir, &init_path, &segment_path)?;
-    if !init_path.is_file() || !segment_path.is_file() {
-        return Err(Error::Pipeline(
-            "pipeline reached EOS without producing CMAF init and media fragments".to_owned(),
-        ));
-    }
+    mux_encoded_track(request, encoded, &combined_path)?;
+
+    let combined = fs::read(&combined_path)?;
+    let (init, media) = split_cmaf(&combined)?;
+    fs::write(&init_path, init)?;
+    fs::write(&segment_path, media)?;
+    let _ = fs::remove_file(&combined_path);
     validate_init_segment(&fs::read(&init_path)?)?;
     validate_media_segment(&fs::read(&segment_path)?)?;
     Ok(SegmentArtifact {
@@ -270,6 +275,142 @@ fn generate_segment_once(
         mode: request.mode,
         cached: false,
     })
+}
+
+struct EncodedTrack {
+    caps: gst::Caps,
+    buffers: Vec<gst::Buffer>,
+}
+
+fn collect_encoded_track(
+    pipeline: &gst::Pipeline,
+    sink: &gst_app::AppSink,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Result<EncodedTrack> {
+    let bus = pipeline
+        .bus()
+        .ok_or_else(|| Error::Pipeline("pipeline has no bus".to_owned()))?;
+    let deadline = std::time::Instant::now() + timeout;
+    let mut caps = None;
+    let mut buffers = Vec::new();
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::Pipeline("pipeline timed out".to_owned()));
+        }
+        if let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_mseconds(100)) {
+            if caps.is_none() {
+                caps = sample.caps_owned();
+            }
+            if let Some(buffer) = sample.buffer_owned() {
+                buffers.push(buffer);
+            }
+            continue;
+        }
+        if sink.is_eos() {
+            break;
+        }
+        if let Some(message) =
+            bus.timed_pop_filtered(gst::ClockTime::ZERO, &[gst::MessageType::Error])
+            && let gst::MessageView::Error(error) = message.view()
+        {
+            return Err(Error::Pipeline(format!(
+                "{} ({:?})",
+                error.error(),
+                error.debug()
+            )));
+        }
+    }
+    let caps =
+        caps.ok_or_else(|| Error::Pipeline("pipeline produced no encoded caps".to_owned()))?;
+    if buffers.is_empty() {
+        return Err(Error::Pipeline(
+            "pipeline produced no encoded media buffers".to_owned(),
+        ));
+    }
+    Ok(EncodedTrack { caps, buffers })
+}
+
+fn mux_encoded_track(
+    request: &SegmentRequest,
+    mut encoded: EncodedTrack,
+    output: &Path,
+) -> Result<()> {
+    normalize_timestamps(&mut encoded.buffers);
+    let pipeline = gst::Pipeline::with_name("air-transcode-cmaf-mux");
+    let _pipeline_cleanup = PipelineCleanup(pipeline.clone());
+    let source = gst::ElementFactory::make("appsrc")
+        .name("encoded-source")
+        .build()
+        .map_err(|_| Error::MissingElement("appsrc".to_owned()))?
+        .downcast::<gst_app::AppSrc>()
+        .map_err(|_| Error::Pipeline("appsrc has an unexpected type".to_owned()))?;
+    source.set_caps(Some(&encoded.caps));
+    source.set_format(gst::Format::Time);
+    source.set_is_live(false);
+    source.set_block(true);
+    let source_element = source.clone().upcast::<gst::Element>();
+    let muxer = gst::ElementFactory::make("cmafmux")
+        .name("muxer")
+        .property("fragment-duration", request.segment.duration_ns)
+        .property(
+            "decode-time-offset",
+            i64::try_from(request.segment.start_ns).unwrap_or(i64::MAX),
+        )
+        .property("start-fragment-sequence-number", request.segment.sequence)
+        .build()
+        .map_err(|_| Error::MissingElement("cmafmux".to_owned()))?;
+    let sink = gst::ElementFactory::make("filesink")
+        .name("sink")
+        .property("location", output.to_string_lossy().as_ref())
+        .property("sync", false)
+        .build()
+        .map_err(|_| Error::MissingElement("filesink".to_owned()))?;
+    pipeline
+        .add_many([&source_element, &muxer, &sink])
+        .map_err(|error| Error::Pipeline(error.to_string()))?;
+    gst::Element::link_many([&source_element, &muxer, &sink])
+        .map_err(|error| Error::Pipeline(error.to_string()))?;
+    pipeline
+        .set_state(gst::State::Playing)
+        .map_err(|error| Error::Pipeline(error.to_string()))?;
+    for buffer in encoded.buffers {
+        if request.cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        source
+            .push_buffer(buffer)
+            .map_err(|error| Error::Pipeline(format!("failed to push encoded buffer: {error}")))?;
+    }
+    source
+        .end_of_stream()
+        .map_err(|error| Error::Pipeline(format!("failed to end encoded stream: {error}")))?;
+    let result = wait_for_pipeline(&pipeline, request.timeout, &request.cancellation);
+    let _ = pipeline.set_state(gst::State::Null);
+    result
+}
+
+fn normalize_timestamps(buffers: &mut [gst::Buffer]) {
+    let base_ns = buffers
+        .iter()
+        .find_map(|buffer| buffer.dts().or_else(|| buffer.pts()))
+        .map_or(0, gst::ClockTime::nseconds);
+    for buffer in buffers {
+        let buffer = buffer.make_mut();
+        if let Some(pts) = buffer.pts() {
+            buffer.set_pts(gst::ClockTime::from_nseconds(
+                pts.nseconds().saturating_sub(base_ns),
+            ));
+        }
+        if let Some(dts) = buffer.dts() {
+            buffer.set_dts(gst::ClockTime::from_nseconds(
+                dts.nseconds().saturating_sub(base_ns),
+            ));
+        }
+    }
 }
 
 fn make(name: &str) -> Result<gst::Element> {
@@ -317,19 +458,38 @@ fn build_track_chain(
             let (width, height) = video_dimensions.ok_or_else(|| {
                 Error::Pipeline("video track has no output dimensions".to_owned())
             })?;
-            Ok(vec![
-                make("videoconvert")?,
-                make("videoscale")?,
-                caps_filter(
-                    &gst::Caps::builder("video/x-raw")
-                        .field("width", i32::try_from(width).unwrap_or(i32::MAX))
-                        .field("height", i32::try_from(height).unwrap_or(i32::MAX))
-                        .build(),
-                )?,
-                encoder,
-                parser,
-                caps_filter(&output_caps)?,
-            ])
+            let width = i32::try_from(width).unwrap_or(i32::MAX);
+            let height = i32::try_from(height).unwrap_or(i32::MAX);
+            let mut chain = if encoder_name.is_some_and(|name| name.starts_with("va"))
+                && gst::ElementFactory::find("vapostproc").is_some()
+            {
+                let postprocess = make("vapostproc")?;
+                postprocess.set_property("disable-passthrough", true);
+                vec![
+                    postprocess,
+                    caps_filter(
+                        &gst::Caps::builder("video/x-raw")
+                            .features(["memory:VAMemory"])
+                            .field("format", "NV12")
+                            .field("width", width)
+                            .field("height", height)
+                            .build(),
+                    )?,
+                ]
+            } else {
+                vec![
+                    make("videoconvert")?,
+                    make("videoscale")?,
+                    caps_filter(
+                        &gst::Caps::builder("video/x-raw")
+                            .field("width", width)
+                            .field("height", height)
+                            .build(),
+                    )?,
+                ]
+            };
+            chain.extend([encoder, parser, caps_filter(&output_caps)?]);
+            Ok(chain)
         }
         (TrackKind::Audio, PipelineMode::Transcode) => {
             let encoder = make(encoder_name.ok_or_else(|| {
@@ -377,7 +537,7 @@ fn configure_video_encoder(encoder: &gst::Element) {
         }
         "openh264enc" => {
             encoder.set_property("gop-size", 120_u32);
-            encoder.set_property("complexity", 0_u32);
+            encoder.set_property_from_str("complexity", "low");
         }
         _ => {}
     }
@@ -486,33 +646,4 @@ fn wait_for_pipeline(
             _ => {}
         }
     }
-}
-
-fn normalize_generated_paths(directory: &Path, init: &Path, segment: &Path) -> Result<()> {
-    if !init.is_file()
-        && let Some(found) = find_prefixed(directory, "init", "mp4")?
-    {
-        fs::rename(found, init)?;
-    }
-    if !segment.is_file()
-        && let Some(found) = find_prefixed(directory, "segment", "m4s")?
-    {
-        fs::rename(found, segment)?;
-    }
-    Ok(())
-}
-
-fn find_prefixed(directory: &Path, prefix: &str, extension: &str) -> Result<Option<PathBuf>> {
-    let mut matches = fs::read_dir(directory)?
-        .filter_map(std::result::Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_stem()
-                .and_then(|stem| stem.to_str())
-                .is_some_and(|stem| stem.starts_with(prefix))
-                && path.extension().and_then(|ext| ext.to_str()) == Some(extension)
-        })
-        .collect::<Vec<_>>();
-    matches.sort();
-    Ok(matches.into_iter().next())
 }

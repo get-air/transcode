@@ -24,14 +24,14 @@ The server prefers a zero-decode path. Browser-safe H.264 and AAC tracks are par
 
 - Rust 1.96.1 for building this checkout.
 - GStreamer 1.28 or newer.
-- `gstreamer`, `gstreamer-pbutils`, `soup` or `reqwest` HTTP source, `hlssink3`, and `isobmff` plugins.
+- `gstreamer`, `gstreamer-app`, `gstreamer-pbutils`, a `soup` or `reqwest` HTTP source, and the `isobmff` plugin.
 - At least one H.264 encoder and one AAC encoder for incompatible inputs.
 
 On Arch Linux:
 
 ```bash
 sudo pacman -S gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad \
-  gst-plugins-ugly gst-libav gst-plugin-hlssink3 gst-plugin-isobmff
+  gst-plugins-ugly gst-libav gst-plugin-isobmff
 ```
 
 Verify the critical runtime surface:

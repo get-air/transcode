@@ -16,8 +16,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::parse();
     air_transcode::initialize()?;
     let state = AppState::new(config.clone())?;
-    if !state.capabilities.cmaf || !state.capabilities.hls_cmaf {
-        return Err("GStreamer cmafmux and hlscmafsink plugins are required".into());
+    if !state.capabilities.cmaf {
+        return Err("GStreamer cmafmux plugin is required".into());
     }
     let listener = TcpListener::bind(config.bind).await?;
     info!(address = %config.bind, "air-transcode listening");

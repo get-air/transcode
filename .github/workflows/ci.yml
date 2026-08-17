@@ -21,7 +21,7 @@ jobs:
           git rustup pkgconf clang ripgrep
           gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad
           gst-plugins-ugly gst-libav
-          gst-plugin-hlssink3 gst-plugin-isobmff
+          gst-plugin-isobmff
 
       - uses: actions/checkout@v4
 

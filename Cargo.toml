@@ -24,6 +24,7 @@ clap = { version = "4.5.46", features = ["derive", "env"] }
 dashmap = "6.1.0"
 futures-util = "0.3.31"
 gstreamer = { version = "0.25.0", features = ["v1_28"] }
+gstreamer-app = { version = "0.25.0", features = ["v1_28"] }
 gstreamer-pbutils = { version = "0.25.0", features = ["v1_28"] }
 http = "1.3.1"
 mime = "0.3.17"
