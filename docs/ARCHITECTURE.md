@@ -41,6 +41,10 @@ Encoder selection is registry-driven rather than operating-system-name-driven. F
 
 `uridecodebin3` receives the selected discovered stream ID and rejects every other stream in its `select-stream` callback. This prevents multilingual sources from instantiating unused decoders and makes the single video/audio HLS renditions deterministic.
 
+The master playlist advertises every audio track as an HLS `AUDIO` rendition and every decodable embedded or caller-supplied external text subtitle as a `SUBTITLES` rendition. Audio caches include the discovered track index, so simultaneous language requests cannot collide. Subtitle pipelines select one exact text stream, prefer a key-unit seek with an accurate-seek fallback, apply a signed timing offset, decode common text formats, strip Pango-only markup, and serialize absolute-timeline WebVTT cues. Player switching is therefore an HLS operation rather than mutable server state.
+
+The product has no whole-source download mode. Tests use generated local files (or explicitly staged samples) to remove origin variability, while production pipelines continue to perform bounded range reads against the caller's source.
+
 ## Concurrency and cancellation
 
 A Tokio semaphore bounds native pipelines. A per-session/track/sequence mutex prevents duplicate work. Requests more than two segments away cancel older work for that track; cancellation is checked during preroll, state transitions, encoder fallback, and bus waits. All encoder attempts share one total deadline rather than multiplying the timeout by the number of candidates. HTTP client disconnect detection still needs an explicit job/lease protocol because Hyper can keep the service future alive after the socket closes.

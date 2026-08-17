@@ -50,6 +50,7 @@ pub struct MediaTrack {
     pub index: usize,
     pub stream_id: Option<String>,
     pub kind: String,
+    pub name: Option<String>,
     pub codec: Option<String>,
     pub video_codec: Option<VideoCodec>,
     pub rfc6381_codec: Option<String>,
@@ -171,6 +172,10 @@ fn collect_streams(stream: &gst_pbutils::DiscovererStreamInfo, tracks: &mut Vec<
         tags.get::<gst::tags::LanguageCode>()
             .map(|value| value.get().to_owned())
     });
+    let name = stream.tags().and_then(|tags| {
+        tags.get::<gst::tags::Title>()
+            .map(|value| value.get().to_owned())
+    });
 
     if let Ok(video) = stream
         .clone()
@@ -184,6 +189,7 @@ fn collect_streams(stream: &gst_pbutils::DiscovererStreamInfo, tracks: &mut Vec<
             codec,
             caps_string,
             language,
+            name,
         ));
     } else if let Ok(audio) = stream
         .clone()
@@ -197,6 +203,21 @@ fn collect_streams(stream: &gst_pbutils::DiscovererStreamInfo, tracks: &mut Vec<
             codec,
             caps_string,
             language,
+            name,
+        ));
+    } else if let Ok(subtitle) = stream
+        .clone()
+        .downcast::<gst_pbutils::DiscovererSubtitleInfo>()
+    {
+        tracks.push(subtitle_track(
+            tracks.len(),
+            &subtitle,
+            caps.as_ref(),
+            stream_id,
+            codec,
+            caps_string,
+            language,
+            name,
         ));
     }
 }
@@ -210,6 +231,7 @@ fn video_track(
     codec: Option<String>,
     caps_string: Option<String>,
     language: Option<String>,
+    name: Option<String>,
 ) -> MediaTrack {
     let structure = caps.and_then(|caps| caps.structure(0));
     let video_codec = structure.and_then(|structure| match structure.name().as_str() {
@@ -242,6 +264,7 @@ fn video_track(
         index,
         stream_id,
         kind: "video".to_owned(),
+        name,
         codec,
         video_codec,
         rfc6381_codec: structure.and_then(|structure| {
@@ -272,6 +295,7 @@ fn audio_track(
     codec: Option<String>,
     caps_string: Option<String>,
     language: Option<String>,
+    name: Option<String>,
 ) -> MediaTrack {
     let web_compatible = caps
         .and_then(|caps| caps.structure(0))
@@ -284,6 +308,7 @@ fn audio_track(
         index,
         stream_id,
         kind: "audio".to_owned(),
+        name,
         codec,
         video_codec: None,
         rfc6381_codec: web_compatible.then(|| "mp4a.40.2".to_owned()),
@@ -296,6 +321,49 @@ fn audio_track(
         height: None,
         channels: Some(audio.channels()),
         sample_rate: Some(audio.sample_rate()),
+        web_compatible,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn subtitle_track(
+    index: usize,
+    subtitle: &gst_pbutils::DiscovererSubtitleInfo,
+    caps: Option<&gst::Caps>,
+    stream_id: Option<String>,
+    codec: Option<String>,
+    caps_string: Option<String>,
+    language: Option<String>,
+    name: Option<String>,
+) -> MediaTrack {
+    let caps_name = caps
+        .and_then(|caps| caps.structure(0))
+        .map(|structure| structure.name().to_string());
+    let web_compatible = caps_name.as_deref().is_some_and(|name| {
+        name == "text/x-raw"
+            || name.starts_with("application/x-subtitle")
+            || matches!(
+                name,
+                "application/x-ssa" | "application/x-ass" | "application/ttml+xml"
+            )
+    });
+    MediaTrack {
+        index,
+        stream_id,
+        kind: "subtitle".to_owned(),
+        name,
+        codec,
+        video_codec: None,
+        rfc6381_codec: None,
+        caps: caps_string,
+        bit_depth: None,
+        colorimetry: None,
+        hdr_format: None,
+        language: language.or_else(|| subtitle.language().map(|value| value.to_string())),
+        width: None,
+        height: None,
+        channels: None,
+        sample_rate: None,
         web_compatible,
     }
 }

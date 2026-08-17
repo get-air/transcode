@@ -56,6 +56,24 @@ pub struct SegmentArtifact {
     pub cached: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct SubtitleRequest {
+    pub source: Url,
+    pub headers: BTreeMap<String, String>,
+    pub segment: SegmentSpec,
+    pub output_path: PathBuf,
+    pub timeout: Duration,
+    pub cancellation: CancellationToken,
+    pub selected_stream_id: Option<String>,
+    pub timestamp_offset_ns: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct SubtitleArtifact {
+    pub path: PathBuf,
+    pub cached: bool,
+}
+
 /// Generates and validates one independent CMAF media segment.
 ///
 /// # Errors
@@ -103,6 +121,277 @@ pub fn generate_segment(request: &SegmentRequest) -> Result<SegmentArtifact> {
         "all compatible encoders failed: {}",
         failures.join("; ")
     )))
+}
+
+/// Extracts one selected text subtitle interval as a standalone `WebVTT` segment.
+///
+/// # Errors
+///
+/// Returns an error when the subtitle cannot be selected, decoded, sought, or
+/// written within the configured deadline.
+#[allow(clippy::too_many_lines)]
+pub fn generate_subtitle_segment(request: &SubtitleRequest) -> Result<SubtitleArtifact> {
+    if request.cancellation.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    if request.output_path.is_file() {
+        let bytes = fs::read(&request.output_path)?;
+        if bytes.starts_with(b"WEBVTT") {
+            return Ok(SubtitleArtifact {
+                path: request.output_path.clone(),
+                cached: true,
+            });
+        }
+        let _ = fs::remove_file(&request.output_path);
+    }
+    if let Some(parent) = request.output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let pipeline = gst::Pipeline::with_name("air-transcode-subtitle-segment");
+    let _pipeline_cleanup = PipelineCleanup(pipeline.clone());
+    let desired_caps = gst::Caps::builder("text/x-raw").build();
+    let source = gst::ElementFactory::make("uridecodebin3")
+        .name("subtitle-source")
+        .property("uri", request.source.as_str())
+        .property("caps", &desired_caps)
+        .build()
+        .map_err(|_| Error::MissingElement("uridecodebin3".to_owned()))?;
+    configure_source(&source, request.headers.clone(), request.timeout);
+    configure_stream_type_selection(
+        &source,
+        gst::StreamType::TEXT,
+        request.selected_stream_id.clone(),
+    );
+    let queue = make("queue")?;
+    let sink = gst::ElementFactory::make("appsink")
+        .name("subtitle-sink")
+        .property("sync", false)
+        .property("max-buffers", 64_u32)
+        .build()
+        .map_err(|_| Error::MissingElement("appsink".to_owned()))?
+        .downcast::<gst_app::AppSink>()
+        .map_err(|_| Error::Pipeline("subtitle appsink has an unexpected type".to_owned()))?;
+    let sink_element = sink.clone().upcast::<gst::Element>();
+    pipeline
+        .add_many([&source, &queue, &sink_element])
+        .map_err(|error| Error::Pipeline(error.to_string()))?;
+    gst::Element::link_many([&queue, &sink_element])
+        .map_err(|error| Error::Pipeline(error.to_string()))?;
+    let queue_sink = queue
+        .static_pad("sink")
+        .ok_or_else(|| Error::Pipeline("subtitle queue has no sink pad".to_owned()))?;
+    let linked = Arc::new(AtomicBool::new(false));
+    let linked_callback = Arc::clone(&linked);
+    source.connect_pad_added(move |_, pad| {
+        if linked_callback.load(Ordering::Acquire) {
+            return;
+        }
+        let caps = pad.current_caps().unwrap_or_else(|| pad.query_caps(None));
+        if caps.can_intersect(&desired_caps) && pad.link(&queue_sink).is_ok() {
+            linked_callback.store(true, Ordering::Release);
+        }
+    });
+
+    pipeline
+        .set_state(gst::State::Paused)
+        .map_err(|error| Error::Pipeline(error.to_string()))?;
+    wait_for_state(
+        &pipeline,
+        gst::State::Paused,
+        request.timeout,
+        &request.cancellation,
+    )?;
+    if !linked.load(Ordering::Acquire) {
+        return Err(Error::Pipeline(
+            "source did not expose the selected text subtitle pad".to_owned(),
+        ));
+    }
+    let source_start_ns = apply_signed_offset(
+        request.segment.start_ns,
+        request.timestamp_offset_ns.saturating_neg(),
+    );
+    let start = gst::ClockTime::from_nseconds(source_start_ns);
+    let stop =
+        gst::ClockTime::from_nseconds(request.segment.start_ns + request.segment.duration_ns);
+    pipeline
+        .set_state(gst::State::Playing)
+        .map_err(|error| Error::Pipeline(error.to_string()))?;
+    let seeked = pipeline
+        .seek(
+            1.0,
+            gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT | gst::SeekFlags::SNAP_BEFORE,
+            gst::SeekType::Set,
+            start,
+            gst::SeekType::None,
+            gst::ClockTime::NONE,
+        )
+        .is_ok()
+        || pipeline
+            .seek(
+                1.0,
+                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                gst::SeekType::Set,
+                start,
+                gst::SeekType::None,
+                gst::ClockTime::NONE,
+            )
+            .is_ok();
+    if !seeked {
+        return Err(Error::Pipeline(
+            "subtitle source rejected key-unit and accurate seeks".to_owned(),
+        ));
+    }
+    let cues = collect_subtitle_cues(
+        &pipeline,
+        &sink,
+        request.segment.start_ns,
+        stop.nseconds(),
+        request.timestamp_offset_ns,
+        request.timeout,
+        &request.cancellation,
+    );
+    let _ = pipeline.set_state(gst::State::Null);
+    let body = render_webvtt(&cues?);
+    fs::write(&request.output_path, body)?;
+    Ok(SubtitleArtifact {
+        path: request.output_path.clone(),
+        cached: false,
+    })
+}
+
+fn collect_subtitle_cues(
+    pipeline: &gst::Pipeline,
+    sink: &gst_app::AppSink,
+    start_ns: u64,
+    stop_ns: u64,
+    timestamp_offset_ns: i64,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Result<Vec<SubtitleCue>> {
+    let bus = pipeline
+        .bus()
+        .ok_or_else(|| Error::Pipeline("subtitle pipeline has no bus".to_owned()))?;
+    let deadline = std::time::Instant::now() + timeout;
+    let mut idle_deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let mut cues = Vec::new();
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::Pipeline("subtitle pipeline timed out".to_owned()));
+        }
+        if std::time::Instant::now() >= idle_deadline {
+            return Ok(cues);
+        }
+        if let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_mseconds(100)) {
+            idle_deadline = std::time::Instant::now() + Duration::from_secs(1);
+            if let Some(buffer) = sample.buffer() {
+                let Some(pts) = buffer.pts() else {
+                    continue;
+                };
+                let source_cue_start_ns = sample
+                    .segment()
+                    .and_then(|segment| segment.downcast_ref::<gst::ClockTime>())
+                    .and_then(|segment| segment.to_stream_time(pts))
+                    .map_or_else(|| pts.nseconds(), gst::ClockTime::nseconds);
+                let cue_start_ns = apply_signed_offset(source_cue_start_ns, timestamp_offset_ns);
+                let cue_end_ns = cue_start_ns.saturating_add(
+                    buffer
+                        .duration()
+                        .map_or(2_000_000_000, gst::ClockTime::nseconds),
+                );
+                if cue_start_ns >= stop_ns {
+                    return Ok(cues);
+                }
+                if cue_end_ns <= start_ns {
+                    continue;
+                }
+                let map = buffer
+                    .map_readable()
+                    .map_err(|_| Error::Pipeline("subtitle buffer is not readable".to_owned()))?;
+                cues.push(SubtitleCue {
+                    start_ns: cue_start_ns.max(start_ns),
+                    end_ns: cue_end_ns.min(stop_ns),
+                    text: plain_subtitle_text(&String::from_utf8_lossy(map.as_slice())),
+                });
+            }
+            continue;
+        }
+        if sink.is_eos() {
+            return Ok(cues);
+        }
+        if let Some(message) =
+            bus.timed_pop_filtered(gst::ClockTime::ZERO, &[gst::MessageType::Error])
+            && let gst::MessageView::Error(error) = message.view()
+        {
+            return Err(Error::Pipeline(format!(
+                "{} ({:?})",
+                error.error(),
+                error.debug()
+            )));
+        }
+    }
+}
+
+const fn apply_signed_offset(timestamp_ns: u64, offset_ns: i64) -> u64 {
+    if offset_ns >= 0 {
+        timestamp_ns.saturating_add(offset_ns.unsigned_abs())
+    } else {
+        timestamp_ns.saturating_sub(offset_ns.unsigned_abs())
+    }
+}
+
+struct SubtitleCue {
+    start_ns: u64,
+    end_ns: u64,
+    text: String,
+}
+
+fn render_webvtt(cues: &[SubtitleCue]) -> String {
+    let mut output = String::from("WEBVTT\n\n");
+    for (index, cue) in cues.iter().enumerate() {
+        use std::fmt::Write as _;
+        let _ = write!(
+            output,
+            "{}\n{} --> {}\n{}\n\n",
+            index + 1,
+            webvtt_timestamp(cue.start_ns),
+            webvtt_timestamp(cue.end_ns),
+            cue.text
+        );
+    }
+    output
+}
+
+fn webvtt_timestamp(nanoseconds: u64) -> String {
+    let milliseconds = nanoseconds / 1_000_000;
+    let hours = milliseconds / 3_600_000;
+    let minutes = milliseconds / 60_000 % 60;
+    let seconds = milliseconds / 1_000 % 60;
+    let milliseconds = milliseconds % 1_000;
+    format!("{hours:02}:{minutes:02}:{seconds:02}.{milliseconds:03}")
+}
+
+fn plain_subtitle_text(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for character in input.chars() {
+        match character {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => output.push(character),
+            _ => {}
+        }
+    }
+    output
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .trim_matches(['\0', '\n', '\r'])
+        .to_owned()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -660,15 +949,23 @@ fn configure_stream_selection(
     track: TrackKind,
     selected_stream_id: Option<String>,
 ) {
+    let wanted = match track {
+        TrackKind::Video => gst::StreamType::VIDEO,
+        TrackKind::Audio => gst::StreamType::AUDIO,
+    };
+    configure_stream_type_selection(source, wanted, selected_stream_id);
+}
+
+fn configure_stream_type_selection(
+    source: &gst::Element,
+    wanted: gst::StreamType,
+    selected_stream_id: Option<String>,
+) {
     let selected = Arc::new(AtomicBool::new(false));
     source.connect("select-stream", false, move |values| {
         let stream = values
             .get(2)
             .and_then(|value| value.get::<gst::Stream>().ok())?;
-        let wanted = match track {
-            TrackKind::Video => gst::StreamType::VIDEO,
-            TrackKind::Audio => gst::StreamType::AUDIO,
-        };
         let id_matches = selected_stream_id
             .as_deref()
             .is_none_or(|selected| stream.stream_id().as_deref() == Some(selected));

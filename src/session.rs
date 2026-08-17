@@ -20,8 +20,8 @@ use crate::{
     config::Config,
     error::{Error, Result},
     gst::{
-        MediaInfo, PipelineMode, ProbeRequest, SegmentArtifact, SegmentRequest, VideoCodec,
-        generate_segment, probe,
+        MediaInfo, PipelineMode, ProbeRequest, SegmentArtifact, SegmentRequest, SubtitleArtifact,
+        SubtitleRequest, VideoCodec, generate_segment, generate_subtitle_segment, probe,
     },
     hls::{SegmentSpec, TrackKind, segment_map},
 };
@@ -31,6 +31,8 @@ pub struct CreateSession {
     pub source: Source,
     #[serde(default)]
     pub output: OutputOptions,
+    #[serde(default)]
+    pub subtitles: Vec<ExternalSubtitle>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -38,6 +40,16 @@ pub struct Source {
     pub url: Url,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ExternalSubtitle {
+    pub source: Source,
+    pub name: String,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub offset_ms: i64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -54,6 +66,8 @@ pub struct OutputOptions {
     pub video_track_index: Option<usize>,
     #[serde(default)]
     pub audio_track_index: Option<usize>,
+    #[serde(default)]
+    pub subtitle_track_index: Option<usize>,
     #[serde(default = "default_video_codecs")]
     pub video_codecs: Vec<VideoCodec>,
 }
@@ -67,6 +81,7 @@ impl Default for OutputOptions {
             max_height: default_max_height(),
             video_track_index: None,
             audio_track_index: None,
+            subtitle_track_index: None,
             video_codecs: default_video_codecs(),
         }
     }
@@ -100,9 +115,12 @@ pub struct SessionView {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RenditionView {
-    pub kind: TrackKind,
+    pub kind: String,
     pub source_track_index: usize,
-    pub mode: PipelineMode,
+    pub name: String,
+    pub language: Option<String>,
+    pub default: bool,
+    pub mode: Option<PipelineMode>,
     pub output_codec: Option<String>,
     pub hdr_passthrough: bool,
 }
@@ -114,9 +132,11 @@ pub struct Session {
     pub media: MediaInfo,
     pub segments: Vec<SegmentSpec>,
     pub directory: PathBuf,
-    segment_locks: DashMap<(TrackKind, u32), Arc<tokio::sync::Mutex<()>>>,
-    prefetch_suppressed: DashMap<(TrackKind, u32), ()>,
-    active_requests: Mutex<HashMap<TrackKind, Vec<ActiveRequest>>>,
+    external_subtitles: HashMap<usize, ExternalSubtitle>,
+    segment_locks: DashMap<(TrackKind, usize, u32), Arc<tokio::sync::Mutex<()>>>,
+    subtitle_locks: DashMap<(usize, u32), Arc<tokio::sync::Mutex<()>>>,
+    prefetch_suppressed: DashMap<(TrackKind, usize, u32), ()>,
+    active_requests: Mutex<HashMap<(TrackKind, usize), Vec<ActiveRequest>>>,
     touched: Mutex<Instant>,
 }
 
@@ -129,25 +149,47 @@ struct ActiveRequest {
 impl Session {
     #[must_use]
     pub fn view(&self) -> SessionView {
-        let renditions = [TrackKind::Video, TrackKind::Audio]
-            .into_iter()
-            .filter_map(|kind| {
-                let track = self.selected_track(kind)?;
-                let mode = self.mode(kind);
-                let output_codec = match (kind, mode) {
-                    (TrackKind::Video, PipelineMode::Transcode) => Some("avc1".to_owned()),
-                    (TrackKind::Audio, PipelineMode::Transcode) => Some("mp4a.40.2".to_owned()),
-                    (_, PipelineMode::Transmux) => track.rfc6381_codec.clone(),
+        let renditions = self
+            .media
+            .tracks
+            .iter()
+            .filter(|track| {
+                track.kind == "audio"
+                    || track.kind == "subtitle" && track.web_compatible
+                    || track.kind == "video"
+                        && self.selected_track(TrackKind::Video).map(|item| item.index)
+                            == Some(track.index)
+            })
+            .map(|track| {
+                let track_kind = match track.kind.as_str() {
+                    "video" => Some(TrackKind::Video),
+                    "audio" => Some(TrackKind::Audio),
+                    _ => None,
                 };
-                Some(RenditionView {
-                    kind,
+                let mode = track_kind.map(|kind| self.mode_for(kind, track.index));
+                let output_codec = match (track_kind, mode) {
+                    (Some(TrackKind::Video), Some(PipelineMode::Transcode)) => {
+                        Some("avc1".to_owned())
+                    }
+                    (Some(TrackKind::Audio), Some(PipelineMode::Transcode)) => {
+                        Some("mp4a.40.2".to_owned())
+                    }
+                    (_, Some(PipelineMode::Transmux)) => track.rfc6381_codec.clone(),
+                    _ if track.kind == "subtitle" => Some("webvtt".to_owned()),
+                    _ => None,
+                };
+                RenditionView {
+                    kind: track.kind.clone(),
                     source_track_index: track.index,
+                    name: Self::track_name(track),
+                    language: track.language.clone(),
+                    default: self.is_default_track(track),
                     mode,
                     output_codec,
-                    hdr_passthrough: kind == TrackKind::Video
-                        && matches!(mode, PipelineMode::Transmux)
+                    hdr_passthrough: track.kind == "video"
+                        && matches!(mode, Some(PipelineMode::Transmux))
                         && track.hdr_format.is_some(),
-                })
+                }
             })
             .collect();
         SessionView {
@@ -176,20 +218,30 @@ impl Session {
 
     #[must_use]
     pub fn mode(&self, kind: TrackKind) -> PipelineMode {
+        let Some(index) = self.selected_track(kind).map(|track| track.index) else {
+            return PipelineMode::Transcode;
+        };
+        self.mode_for(kind, index)
+    }
+
+    #[must_use]
+    pub fn mode_for(&self, kind: TrackKind, index: usize) -> PipelineMode {
         if self.output.force_transcode || !self.output.transmux {
             return PipelineMode::Transcode;
         }
-        let compatible = self.selected_track(kind).is_some_and(|track| {
-            let codec_compatible = track.web_compatible
-                || kind == TrackKind::Video
-                    && track
-                        .video_codec
-                        .is_some_and(|codec| self.output.video_codecs.contains(&codec));
-            let dimensions_compatible = kind != TrackKind::Video
-                || track.width.unwrap_or(0) <= self.output.max_width
-                    && track.height.unwrap_or(0) <= self.output.max_height;
-            codec_compatible && dimensions_compatible
-        });
+        let compatible = self
+            .track_by_index(kind.as_str(), index)
+            .is_some_and(|track| {
+                let codec_compatible = track.web_compatible
+                    || kind == TrackKind::Video
+                        && track
+                            .video_codec
+                            .is_some_and(|codec| self.output.video_codecs.contains(&codec));
+                let dimensions_compatible = kind != TrackKind::Video
+                    || track.width.unwrap_or(0) <= self.output.max_width
+                        && track.height.unwrap_or(0) <= self.output.max_height;
+                codec_compatible && dimensions_compatible
+            });
         if compatible {
             PipelineMode::Transmux
         } else {
@@ -247,6 +299,47 @@ impl Session {
             track.kind == kind.as_str() && requested_index.is_none_or(|index| track.index == index)
         })
     }
+
+    #[must_use]
+    pub fn track_by_index(&self, kind: &str, index: usize) -> Option<&crate::gst::MediaTrack> {
+        self.media
+            .tracks
+            .iter()
+            .find(|track| track.kind == kind && track.index == index)
+    }
+
+    pub fn tracks(&self, kind: &str) -> impl Iterator<Item = &crate::gst::MediaTrack> {
+        self.media
+            .tracks
+            .iter()
+            .filter(move |track| track.kind == kind)
+    }
+
+    #[must_use]
+    pub fn default_track_index(&self, kind: &str) -> Option<usize> {
+        let requested = match kind {
+            "video" => self.output.video_track_index,
+            "audio" => self.output.audio_track_index,
+            "subtitle" => self.output.subtitle_track_index,
+            _ => None,
+        };
+        if kind == "subtitle" {
+            return requested;
+        }
+        requested.or_else(|| self.tracks(kind).next().map(|track| track.index))
+    }
+
+    fn is_default_track(&self, track: &crate::gst::MediaTrack) -> bool {
+        self.default_track_index(&track.kind) == Some(track.index)
+    }
+
+    fn track_name(track: &crate::gst::MediaTrack) -> String {
+        track
+            .name
+            .clone()
+            .or_else(|| track.language.clone())
+            .unwrap_or_else(|| format!("{} {}", track.kind, track.index))
+    }
 }
 
 #[derive(Clone)]
@@ -266,6 +359,7 @@ struct Metrics {
     failed_pipelines: AtomicU64,
     transmux_segments: AtomicU64,
     transcode_segments: AtomicU64,
+    subtitle_segments: AtomicU64,
     cancelled_pipelines: AtomicU64,
 }
 
@@ -278,6 +372,7 @@ pub struct MetricsSnapshot {
     pub failed_pipelines: u64,
     pub transmux_segments: u64,
     pub transcode_segments: u64,
+    pub subtitle_segments: u64,
     pub cancelled_pipelines: u64,
 }
 
@@ -306,6 +401,7 @@ impl Metrics {
             failed_pipelines: self.failed_pipelines.load(Ordering::Relaxed),
             transmux_segments: self.transmux_segments.load(Ordering::Relaxed),
             transcode_segments: self.transcode_segments.load(Ordering::Relaxed),
+            subtitle_segments: self.subtitle_segments.load(Ordering::Relaxed),
             cancelled_pipelines: self.cancelled_pipelines.load(Ordering::Relaxed),
         }
     }
@@ -334,6 +430,28 @@ impl SessionManager {
     /// Returns an error when discovery, task execution, or cache setup fails.
     pub async fn create(&self, request: CreateSession) -> Result<Arc<Session>> {
         validate_source(&request.source)?;
+        if request.subtitles.len() > 64 {
+            return Err(Error::InvalidOutput(
+                "a session may include at most 64 external subtitles".to_owned(),
+            ));
+        }
+        for subtitle in &request.subtitles {
+            validate_source(&subtitle.source)?;
+            if subtitle.name.trim().is_empty() || subtitle.name.len() > 256 {
+                return Err(Error::InvalidOutput(
+                    "external subtitle names must contain 1 to 256 characters".to_owned(),
+                ));
+            }
+            if subtitle
+                .language
+                .as_ref()
+                .is_some_and(|language| language.len() > 64)
+            {
+                return Err(Error::InvalidOutput(
+                    "external subtitle language exceeds 64 characters".to_owned(),
+                ));
+            }
+        }
         if request.output.max_width < 2 || request.output.max_height < 2 {
             return Err(Error::InvalidOutput(
                 "max_width and max_height must both be at least 2".to_owned(),
@@ -346,9 +464,33 @@ impl SessionManager {
             headers: request.source.headers.clone(),
             timeout: self.config.probe_timeout(),
         };
-        let media = tokio::task::spawn_blocking(move || probe(&probe_request))
+        let mut media = tokio::task::spawn_blocking(move || probe(&probe_request))
             .await
             .map_err(|error| Error::Task(error.to_string()))??;
+        let mut external_subtitles = HashMap::new();
+        for subtitle in request.subtitles {
+            let index = media.tracks.len();
+            media.tracks.push(crate::gst::MediaTrack {
+                index,
+                stream_id: None,
+                kind: "subtitle".to_owned(),
+                name: Some(subtitle.name.clone()),
+                codec: Some("external text subtitle".to_owned()),
+                video_codec: None,
+                rfc6381_codec: None,
+                caps: None,
+                bit_depth: None,
+                colorimetry: None,
+                hdr_format: None,
+                language: subtitle.language.clone(),
+                width: None,
+                height: None,
+                channels: None,
+                sample_rate: None,
+                web_compatible: true,
+            });
+            external_subtitles.insert(index, subtitle);
+        }
         validate_track_selection(&media, &request.output)?;
         let id = Uuid::new_v4();
         let directory = self.config.cache_dir.join(id.to_string());
@@ -361,7 +503,9 @@ impl SessionManager {
             segments: segment_map(media.duration_ns, target_ns),
             media,
             directory,
+            external_subtitles,
             segment_locks: DashMap::new(),
+            subtitle_locks: DashMap::new(),
             prefetch_suppressed: DashMap::new(),
             active_requests: Mutex::new(HashMap::new()),
             touched: Mutex::new(Instant::now()),
@@ -414,7 +558,37 @@ impl SessionManager {
         track: TrackKind,
         sequence: u32,
     ) -> Result<SegmentArtifact> {
-        if !session.has_track(track) {
+        let track_index = session
+            .selected_track(track)
+            .map(|item| item.index)
+            .ok_or_else(|| Error::TrackNotFound(track.as_str().to_owned()))?;
+        self.segment_for(session, track, track_index, sequence)
+            .await
+    }
+
+    /// Generates one video or audio rendition by its discovered source index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid rendition, scheduler failure, or media
+    /// processing failure.
+    #[allow(clippy::too_many_lines)]
+    pub async fn segment_for(
+        &self,
+        session: Arc<Session>,
+        track: TrackKind,
+        track_index: usize,
+        sequence: u32,
+    ) -> Result<SegmentArtifact> {
+        let selected_track = session
+            .track_by_index(track.as_str(), track_index)
+            .ok_or_else(|| Error::TrackNotFound(format!("{} {track_index}", track.as_str())))?;
+        if track == TrackKind::Video
+            && session
+                .selected_track(TrackKind::Video)
+                .map(|item| item.index)
+                != Some(track_index)
+        {
             return Err(Error::TrackNotFound(track.as_str().to_owned()));
         }
         let segment = session
@@ -425,7 +599,7 @@ impl SessionManager {
             .ok_or(Error::SegmentOutOfRange { sequence })?;
         let generation_lock = session
             .segment_locks
-            .entry((track, sequence))
+            .entry((track, track_index, sequence))
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _generation_guard = generation_lock.lock().await;
@@ -433,7 +607,7 @@ impl SessionManager {
         let cancellation = CancellationToken::new();
         {
             let mut active = session.active_requests.lock();
-            let requests = active.entry(track).or_default();
+            let requests = active.entry((track, track_index)).or_default();
             for request in requests.iter() {
                 if request.sequence.abs_diff(sequence) > 2 {
                     request.cancellation.cancel();
@@ -446,7 +620,7 @@ impl SessionManager {
             });
             drop(active);
         }
-        let mode = session.mode(track);
+        let mode = session.mode_for(track, track_index);
         let request = SegmentRequest {
             source: session.source.url.clone(),
             headers: session.source.headers.clone(),
@@ -456,16 +630,13 @@ impl SessionManager {
             output_dir: session
                 .directory
                 .join(track.as_str())
+                .join(track_index.to_string())
                 .join(sequence.to_string()),
             timeout: Duration::from_secs(60),
             cancellation: cancellation.clone(),
             video_dimensions: session.video_output_dimensions(),
-            selected_stream_id: session
-                .selected_track(track)
-                .and_then(|track| track.stream_id.clone()),
-            transmux_video_codec: session
-                .selected_track(track)
-                .and_then(|track| track.video_codec),
+            selected_stream_id: selected_track.stream_id.clone(),
+            transmux_video_codec: selected_track.video_codec,
         };
         let cancel_on_drop = cancellation.drop_guard();
         let permit = Arc::clone(&self.pipelines)
@@ -482,10 +653,10 @@ impl SessionManager {
         .map_err(|error| Error::Task(error.to_string()))?;
         {
             let mut active = session.active_requests.lock();
-            if let Some(requests) = active.get_mut(&track) {
+            if let Some(requests) = active.get_mut(&(track, track_index)) {
                 requests.retain(|request| request.id != request_id);
                 if requests.is_empty() {
-                    active.remove(&track);
+                    active.remove(&(track, track_index));
                 }
             }
         }
@@ -518,7 +689,7 @@ impl SessionManager {
         }
         let suppress_prefetch = session
             .prefetch_suppressed
-            .remove(&(track, sequence))
+            .remove(&(track, track_index, sequence))
             .is_some();
         if !suppress_prefetch
             && result.is_ok()
@@ -527,21 +698,133 @@ impl SessionManager {
                 .iter()
                 .any(|segment| segment.sequence == sequence.saturating_add(1))
         {
-            self.spawn_prefetch(Arc::clone(&session), track, sequence.saturating_add(1));
+            self.spawn_prefetch(
+                Arc::clone(&session),
+                track,
+                track_index,
+                sequence.saturating_add(1),
+            );
         }
         result
     }
 
-    fn spawn_prefetch(&self, session: Arc<Session>, track: TrackKind, sequence: u32) {
-        session.prefetch_suppressed.insert((track, sequence), ());
+    /// Generates a `WebVTT` subtitle segment for a discovered text track.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid/non-text subtitle, out-of-range segment,
+    /// scheduler failure, or subtitle decoding failure.
+    pub async fn subtitle_segment(
+        &self,
+        session: Arc<Session>,
+        track_index: usize,
+        sequence: u32,
+    ) -> Result<SubtitleArtifact> {
+        let track = session
+            .track_by_index("subtitle", track_index)
+            .filter(|track| track.web_compatible)
+            .ok_or_else(|| Error::TrackNotFound(format!("subtitle {track_index}")))?;
+        let (source, selected_stream_id, timestamp_offset_ns) =
+            session.external_subtitles.get(&track_index).map_or_else(
+                || (session.source.clone(), track.stream_id.clone(), 0_i64),
+                |subtitle| {
+                    (
+                        subtitle.source.clone(),
+                        None,
+                        subtitle.offset_ms.saturating_mul(1_000_000),
+                    )
+                },
+            );
+        let segment = session
+            .segments
+            .iter()
+            .find(|segment| segment.sequence == sequence)
+            .cloned()
+            .ok_or(Error::SegmentOutOfRange { sequence })?;
+        let generation_lock = session
+            .subtitle_locks
+            .entry((track_index, sequence))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _generation_guard = generation_lock.lock().await;
+        let cancellation = CancellationToken::new();
+        let request = SubtitleRequest {
+            source: source.url,
+            headers: source.headers,
+            segment,
+            output_path: session
+                .directory
+                .join("subtitles")
+                .join(track_index.to_string())
+                .join(format!("{sequence}.vtt")),
+            timeout: Duration::from_secs(60),
+            cancellation: cancellation.clone(),
+            selected_stream_id,
+            timestamp_offset_ns,
+        };
+        let cancel_on_drop = cancellation.drop_guard();
+        let permit = Arc::clone(&self.pipelines)
+            .acquire_owned()
+            .await
+            .map_err(|error| Error::Task(error.to_string()))?;
+        let metrics = Arc::clone(&self.metrics);
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let _active = metrics.enter();
+            generate_subtitle_segment(&request)
+        })
+        .await
+        .map_err(|error| Error::Task(error.to_string()))?;
+        cancel_on_drop.disarm();
+        match &result {
+            Ok(artifact) if artifact.cached => {
+                self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(_) => {
+                self.metrics
+                    .generated_segments
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .subtitle_segments
+                    .fetch_add(1, Ordering::Relaxed);
+                self.prune_session_cache(&session)?;
+            }
+            Err(Error::Cancelled) => {
+                self.metrics
+                    .cancelled_pipelines
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                self.metrics
+                    .failed_pipelines
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        result
+    }
+
+    fn spawn_prefetch(
+        &self,
+        session: Arc<Session>,
+        track: TrackKind,
+        track_index: usize,
+        sequence: u32,
+    ) {
+        session
+            .prefetch_suppressed
+            .insert((track, track_index, sequence), ());
         let manager = self.clone();
         let _prefetch = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(25)).await;
             if manager.pipelines.available_permits() == 0 {
-                session.prefetch_suppressed.remove(&(track, sequence));
+                session
+                    .prefetch_suppressed
+                    .remove(&(track, track_index, sequence));
                 return;
             }
-            let _ = Box::pin(manager.segment(Arc::clone(&session), track, sequence)).await;
+            let _ =
+                Box::pin(manager.segment_for(Arc::clone(&session), track, track_index, sequence))
+                    .await;
         });
     }
 
@@ -579,26 +862,34 @@ impl SessionManager {
 
     fn prune_session_cache(&self, session: &Session) -> Result<()> {
         let limit = self.config.max_cached_segments.max(1);
-        for track in [TrackKind::Video, TrackKind::Audio] {
-            let track_dir = session.directory.join(track.as_str());
-            if !track_dir.is_dir() {
+        for kind in ["video", "audio", "subtitles"] {
+            let kind_dir = session.directory.join(kind);
+            if !kind_dir.is_dir() {
                 continue;
             }
-            let mut entries = std::fs::read_dir(&track_dir)?
+            for rendition in std::fs::read_dir(&kind_dir)?
                 .filter_map(std::result::Result::ok)
                 .filter(|entry| entry.path().is_dir())
-                .filter_map(|entry| {
-                    let modified = entry.metadata().ok()?.modified().ok()?;
-                    Some((modified, entry.path()))
-                })
-                .collect::<Vec<_>>();
-            if entries.len() <= limit {
-                continue;
-            }
-            entries.sort_by_key(|(modified, _)| *modified);
-            let remove_count = entries.len() - limit;
-            for (_, path) in entries.into_iter().take(remove_count) {
-                std::fs::remove_dir_all(path)?;
+            {
+                let mut entries = std::fs::read_dir(rendition.path())?
+                    .filter_map(std::result::Result::ok)
+                    .filter_map(|entry| {
+                        let modified = entry.metadata().ok()?.modified().ok()?;
+                        Some((modified, entry.path()))
+                    })
+                    .collect::<Vec<_>>();
+                if entries.len() <= limit {
+                    continue;
+                }
+                entries.sort_by_key(|(modified, _)| *modified);
+                let remove_count = entries.len() - limit;
+                for (_, path) in entries.into_iter().take(remove_count) {
+                    if path.is_dir() {
+                        std::fs::remove_dir_all(path)?;
+                    } else {
+                        std::fs::remove_file(path)?;
+                    }
+                }
             }
         }
         Ok(())
@@ -606,6 +897,12 @@ impl SessionManager {
 }
 
 fn validate_source(source: &Source) -> Result<()> {
+    if !matches!(source.url.scheme(), "http" | "https" | "file") {
+        return Err(Error::InvalidSource(format!(
+            "scheme {} is not supported",
+            source.url.scheme()
+        )));
+    }
     if source.url.as_str().len() > 16 * 1024 {
         return Err(Error::InvalidSource("URL exceeds 16 KiB".to_owned()));
     }
@@ -634,18 +931,18 @@ fn validate_source(source: &Source) -> Result<()> {
 
 fn validate_track_selection(media: &MediaInfo, output: &OutputOptions) -> Result<()> {
     for (kind, index) in [
-        (TrackKind::Video, output.video_track_index),
-        (TrackKind::Audio, output.audio_track_index),
+        ("video", output.video_track_index),
+        ("audio", output.audio_track_index),
+        ("subtitle", output.subtitle_track_index),
     ] {
         if let Some(index) = index
             && !media
                 .tracks
                 .iter()
-                .any(|track| track.index == index && track.kind == kind.as_str())
+                .any(|track| track.index == index && track.kind == kind)
         {
             return Err(Error::InvalidOutput(format!(
-                "track index {index} is not a {} track",
-                kind.as_str()
+                "track index {index} is not a {kind} track"
             )));
         }
     }

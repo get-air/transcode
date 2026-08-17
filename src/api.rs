@@ -20,7 +20,10 @@ use crate::{
     config::Config,
     error::{Error, Result},
     gst::{Capabilities, inspect_capabilities},
-    hls::{TrackKind, master_playlist, media_playlist},
+    hls::{
+        RenditionSpec, TrackKind, indexed_media_playlist, master_playlist, media_playlist,
+        subtitle_playlist,
+    },
     session::{CreateSession, SessionManager, SessionView},
 };
 
@@ -57,6 +60,26 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/sessions/{id}/master.m3u8", get(master))
         .route("/v1/sessions/{id}/video.m3u8", get(video_media))
         .route("/v1/sessions/{id}/audio.m3u8", get(audio_media))
+        .route(
+            "/v1/sessions/{id}/audio/{track_index}/playlist.m3u8",
+            get(indexed_audio_media),
+        )
+        .route(
+            "/v1/sessions/{id}/audio/{track_index}/init.mp4",
+            get(indexed_audio_init),
+        )
+        .route(
+            "/v1/sessions/{id}/audio/{track_index}/segments/{sequence}",
+            get(indexed_audio_segment),
+        )
+        .route(
+            "/v1/sessions/{id}/subtitles/{track_index}/playlist.m3u8",
+            get(indexed_subtitle_media),
+        )
+        .route(
+            "/v1/sessions/{id}/subtitles/{track_index}/segments/{sequence}",
+            get(indexed_subtitle_segment),
+        )
         .route("/v1/sessions/{id}/{track}/init.mp4", get(init))
         .route(
             "/v1/sessions/{id}/{track}/segments/{sequence}",
@@ -120,13 +143,59 @@ async fn delete_session(
 async fn master(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> Result<Response> {
     let session = state.sessions.get(id)?;
     let codecs = session.output_codecs();
+    let rendition = |track: &crate::gst::MediaTrack| RenditionSpec {
+        index: track.index,
+        name: track
+            .name
+            .clone()
+            .or_else(|| track.language.clone())
+            .unwrap_or_else(|| format!("{} {}", track.kind, track.index)),
+        language: track.language.clone(),
+        default: session.default_track_index(&track.kind) == Some(track.index),
+    };
+    let audio = session.tracks("audio").map(rendition).collect::<Vec<_>>();
+    let subtitles = session
+        .tracks("subtitle")
+        .filter(|track| track.web_compatible)
+        .map(rendition)
+        .collect::<Vec<_>>();
     let body = master_playlist(
         session.has_track(TrackKind::Video),
-        session.has_track(TrackKind::Audio),
+        &audio,
+        &subtitles,
         8_000_000,
         codecs.as_deref(),
     );
     Ok(playlist_response(body))
+}
+
+async fn indexed_audio_media(
+    State(state): State<Arc<AppState>>,
+    Path((id, track_index)): Path<(Uuid, usize)>,
+) -> Result<Response> {
+    let session = state.sessions.get(id)?;
+    session
+        .track_by_index("audio", track_index)
+        .ok_or_else(|| Error::TrackNotFound(format!("audio {track_index}")))?;
+    Ok(playlist_response(indexed_media_playlist(
+        track_index,
+        &session.segments,
+    )))
+}
+
+async fn indexed_subtitle_media(
+    State(state): State<Arc<AppState>>,
+    Path((id, track_index)): Path<(Uuid, usize)>,
+) -> Result<Response> {
+    let session = state.sessions.get(id)?;
+    session
+        .track_by_index("subtitle", track_index)
+        .filter(|track| track.web_compatible)
+        .ok_or_else(|| Error::TrackNotFound(format!("subtitle {track_index}")))?;
+    Ok(playlist_response(subtitle_playlist(
+        track_index,
+        &session.segments,
+    )))
 }
 
 async fn video_media(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> Result<Response> {
@@ -163,6 +232,42 @@ async fn segment(
     let session = state.sessions.get(id)?;
     let artifact = state.sessions.segment(session, track, sequence).await?;
     file_response(&artifact.segment_path, "video/iso.segment").await
+}
+
+async fn indexed_audio_init(
+    State(state): State<Arc<AppState>>,
+    Path((id, track_index)): Path<(Uuid, usize)>,
+) -> Result<Response> {
+    let session = state.sessions.get(id)?;
+    let artifact = state
+        .sessions
+        .segment_for(session, TrackKind::Audio, track_index, 1)
+        .await?;
+    file_response(&artifact.init_path, "video/mp4").await
+}
+
+async fn indexed_audio_segment(
+    State(state): State<Arc<AppState>>,
+    Path((id, track_index, sequence)): Path<(Uuid, usize, u32)>,
+) -> Result<Response> {
+    let session = state.sessions.get(id)?;
+    let artifact = state
+        .sessions
+        .segment_for(session, TrackKind::Audio, track_index, sequence)
+        .await?;
+    file_response(&artifact.segment_path, "video/iso.segment").await
+}
+
+async fn indexed_subtitle_segment(
+    State(state): State<Arc<AppState>>,
+    Path((id, track_index, sequence)): Path<(Uuid, usize, u32)>,
+) -> Result<Response> {
+    let session = state.sessions.get(id)?;
+    let artifact = state
+        .sessions
+        .subtitle_segment(session, track_index, sequence)
+        .await?;
+    file_response(&artifact.path, "text/vtt; charset=utf-8").await
 }
 
 fn parse_track(track: &str) -> Result<TrackKind> {

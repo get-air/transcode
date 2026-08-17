@@ -109,6 +109,7 @@ async fn remote_http_transmux_is_seekable_deduplicated_and_playable() -> TestRes
         .path()
         .join(id)
         .join("video")
+        .join("0")
         .join("1")
         .join("segment.m4s");
     std::fs::write(cached_segment, b"corrupt")?;
@@ -401,6 +402,218 @@ async fn declared_modern_video_codecs_are_transmuxed_without_reencoding() -> Tes
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
+async fn exposes_switchable_audio_and_webvtt_subtitle_renditions() -> TestResult {
+    air_transcode::initialize()?;
+    let fixtures = tempfile::tempdir()?;
+    let fixture = fixtures.path().join("multi-track.mkv");
+    generate_fixture(&fixture, FixtureKind::MultiTrack)?;
+    let external_subtitle = fixtures.path().join("external-fr.srt");
+    std::fs::write(
+        &external_subtitle,
+        "1\n00:00:00,600 --> 00:00:01,600\nBonjour externe\n\n2\n00:00:02,600 --> 00:00:03,600\nDeuxième externe\n",
+    )?;
+    let external_subtitle_url = url::Url::from_file_path(&external_subtitle)
+        .map_err(|()| io::Error::other("failed to create external subtitle file URL"))?;
+    let origin_state = OriginState {
+        bytes: Arc::new(std::fs::read(&fixture)?),
+        range_requests: Arc::new(AtomicUsize::new(0)),
+    };
+    let origin = Router::new()
+        .route("/media", get(origin_media))
+        .with_state(origin_state);
+    let (origin_url, origin_task) = spawn(origin).await?;
+    let (server_url, server_task, _cache) = spawn_transcoder().await?;
+    let client = reqwest::Client::new();
+    let invalid_external = client
+        .post(format!("{server_url}/v1/sessions"))
+        .json(&json!({
+            "source": {
+                "url": format!("{origin_url}/media"),
+                "headers": { "Authorization": "Bearer fixture" }
+            },
+            "subtitles": [{
+                "source": { "url": "ftp://example.invalid/subtitle.srt" },
+                "name": "Invalid"
+            }]
+        }))
+        .send()
+        .await?;
+    assert_eq!(invalid_external.status(), StatusCode::BAD_REQUEST);
+    let session: Value = client
+        .post(format!("{server_url}/v1/sessions"))
+        .json(&json!({
+            "source": {
+                "url": format!("{origin_url}/media"),
+                "headers": { "Authorization": "Bearer fixture" }
+            },
+            "output": { "force_transcode": true, "max_width": 1920 },
+            "subtitles": [{
+                "source": { "url": external_subtitle_url },
+                "name": "French External",
+                "language": "fr"
+            }]
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let id = json_string(&session, "id")?;
+    let audio = session["tracks"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("tracks are not an array"))?
+        .iter()
+        .filter(|track| track["kind"] == "audio")
+        .filter_map(|track| track["index"].as_u64())
+        .collect::<Vec<_>>();
+    let subtitles = session["tracks"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("tracks are not an array"))?
+        .iter()
+        .filter(|track| track["kind"] == "subtitle")
+        .filter_map(|track| track["index"].as_u64())
+        .collect::<Vec<_>>();
+    assert_eq!(audio.len(), 2);
+    assert_eq!(subtitles.len(), 3);
+
+    let master = client
+        .get(format!("{server_url}/v1/sessions/{id}/master.m3u8"))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    assert_eq!(master.matches("TYPE=AUDIO").count(), 2);
+    assert_eq!(master.matches("TYPE=SUBTITLES").count(), 3);
+    assert!(master.contains("SUBTITLES=\"subtitles\""));
+    for subtitle in &subtitles {
+        let playlist = client
+            .get(format!(
+                "{server_url}/v1/sessions/{id}/subtitles/{subtitle}/playlist.m3u8"
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        assert!(playlist.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
+        assert!(playlist.contains("segments/1"));
+    }
+
+    let first_audio = fetch_bytes(
+        &client,
+        format!(
+            "{server_url}/v1/sessions/{id}/audio/{}/segments/1",
+            audio[0]
+        ),
+    )
+    .await?;
+    let second_audio = fetch_bytes(
+        &client,
+        format!(
+            "{server_url}/v1/sessions/{id}/audio/{}/segments/1",
+            audio[1]
+        ),
+    )
+    .await?;
+    validate_media_segment(&first_audio)?;
+    validate_media_segment(&second_audio)?;
+    assert_ne!(media_data(&first_audio), media_data(&second_audio));
+
+    let first_subtitle = fetch_bytes(
+        &client,
+        format!(
+            "{server_url}/v1/sessions/{id}/subtitles/{}/segments/1",
+            subtitles[0]
+        ),
+    )
+    .await?;
+    let second_subtitle = fetch_bytes(
+        &client,
+        format!(
+            "{server_url}/v1/sessions/{id}/subtitles/{}/segments/1",
+            subtitles[1]
+        ),
+    )
+    .await?;
+    assert!(first_subtitle.starts_with(b"WEBVTT"));
+    assert!(second_subtitle.starts_with(b"WEBVTT"));
+    assert_ne!(first_subtitle, second_subtitle);
+    let subtitle_text = format!(
+        "{} {}",
+        String::from_utf8_lossy(&first_subtitle),
+        String::from_utf8_lossy(&second_subtitle)
+    );
+    assert!(subtitle_text.contains("Hello") && subtitle_text.contains("Hola"));
+    let external_text = fetch_bytes(
+        &client,
+        format!(
+            "{server_url}/v1/sessions/{id}/subtitles/{}/segments/1",
+            subtitles[2]
+        ),
+    )
+    .await?;
+    assert!(String::from_utf8_lossy(&external_text).contains("Bonjour externe"));
+
+    let later_subtitles = futures_util::future::try_join_all(subtitles.iter().map(|track| {
+        fetch_bytes(
+            &client,
+            format!("{server_url}/v1/sessions/{id}/subtitles/{track}/segments/2"),
+        )
+    }))
+    .await?;
+    let later_text = later_subtitles
+        .iter()
+        .map(|bytes| String::from_utf8_lossy(bytes))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        later_text.contains("Second English") && later_text.contains("Segundo"),
+        "unexpected later subtitles: {later_text}"
+    );
+
+    let cached_subtitle = fetch_bytes(
+        &client,
+        format!(
+            "{server_url}/v1/sessions/{id}/subtitles/{}/segments/1",
+            subtitles[0]
+        ),
+    )
+    .await?;
+    assert_eq!(cached_subtitle, first_subtitle);
+    let metrics: Value = client
+        .get(format!("{server_url}/v1/metrics"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(
+        metrics["subtitle_segments"]
+            .as_u64()
+            .is_some_and(|value| value >= 4)
+    );
+    assert!(
+        metrics["cache_hits"]
+            .as_u64()
+            .is_some_and(|value| value >= 1)
+    );
+
+    let invalid = client
+        .get(format!(
+            "{server_url}/v1/sessions/{id}/audio/9999/segments/1"
+        ))
+        .send()
+        .await?;
+    assert_eq!(invalid.status(), StatusCode::NOT_FOUND);
+
+    origin_task.abort();
+    server_task.abort();
+    Ok(())
+}
+
 async fn create_session(
     client: &reqwest::Client,
     server_url: &str,
@@ -535,6 +748,7 @@ enum FixtureKind {
     Av1Aac,
     Vp9Opus,
     MultiAac,
+    MultiTrack,
 }
 
 fn generate_fixture(path: &Path, kind: FixtureKind) -> TestResult {
@@ -545,6 +759,27 @@ fn generate_fixture(path: &Path, kind: FixtureKind) -> TestResult {
                 path.display()
             ),
             Duration::from_secs(20),
+        );
+    }
+    if matches!(kind, FixtureKind::MultiTrack) {
+        let english = path.with_extension("en.srt");
+        let spanish = path.with_extension("es.srt");
+        std::fs::write(
+            &english,
+            "1\n00:00:00,500 --> 00:00:01,500\nHello from English\n\n2\n00:00:02,500 --> 00:00:03,500\nSecond English cue\n",
+        )?;
+        std::fs::write(
+            &spanish,
+            "1\n00:00:00,500 --> 00:00:01,500\nHola desde Español\n\n2\n00:00:02,500 --> 00:00:03,500\nSegundo subtítulo\n",
+        )?;
+        return run_pipeline(
+            &format!(
+                "matroskamux name=mux min-index-interval=1000000000 ! filesink location={} videotestsrc num-buffers=180 pattern=smpte ! video/x-raw,format=I420,width=320,height=180,framerate=30/1 ! x264enc speed-preset=ultrafast tune=zerolatency key-int-max=30 bframes=0 byte-stream=false ! h264parse ! queue ! mux. audiotestsrc num-buffers=282 wave=sine freq=440 ! audio/x-raw,rate=48000,channels=2 ! avenc_aac ! taginject tags=\"language-code=en,title=English\" ! aacparse ! queue ! mux. audiotestsrc num-buffers=282 wave=sine freq=880 ! audio/x-raw,rate=48000,channels=2 ! avenc_aac ! taginject tags=\"language-code=es,title=Spanish\" ! aacparse ! queue ! mux. filesrc location={} ! subparse ! taginject tags=\"language-code=en,title=English\" ! queue ! mux. filesrc location={} ! subparse ! taginject tags=\"language-code=es,title=Spanish\" ! queue ! mux.",
+                path.display(),
+                english.display(),
+                spanish.display()
+            ),
+            Duration::from_secs(30),
         );
     }
     let mux_and_video = match kind {
@@ -567,6 +802,9 @@ fn generate_fixture(path: &Path, kind: FixtureKind) -> TestResult {
         FixtureKind::MultiAac => {
             return Err(io::Error::other("multi-audio fixture returned too late").into());
         }
+        FixtureKind::MultiTrack => {
+            return Err(io::Error::other("multi-track fixture returned too late").into());
+        }
     };
     let audio = match kind {
         FixtureKind::H264Aac => {
@@ -580,6 +818,9 @@ fn generate_fixture(path: &Path, kind: FixtureKind) -> TestResult {
         }
         FixtureKind::MultiAac => {
             return Err(io::Error::other("multi-audio fixture returned too late").into());
+        }
+        FixtureKind::MultiTrack => {
+            return Err(io::Error::other("multi-track fixture returned too late").into());
         }
     };
     run_pipeline(&format!("{mux_and_video} {audio}"), Duration::from_secs(20))

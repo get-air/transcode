@@ -21,6 +21,8 @@ pub struct Capabilities {
     pub http: bool,
     pub transmux_video_codecs: Vec<VideoCodec>,
     pub hdr_tone_mapping: HdrToneMapping,
+    pub subtitle_inputs: Vec<String>,
+    pub subtitle_output: String,
     pub h264_encoders: Vec<EncoderCandidate>,
     pub aac_encoders: Vec<EncoderCandidate>,
 }
@@ -94,6 +96,17 @@ pub fn inspect_capabilities() -> Capabilities {
     if available("av1parse") {
         transmux_video_codecs.push(VideoCodec::Av1);
     }
+    let mut subtitle_inputs = Vec::new();
+    if available("subparse") {
+        subtitle_inputs
+            .extend(["srt", "webvtt", "microdvd", "sami", "mpl2", "dks", "lrc"].map(str::to_owned));
+    }
+    if available("ssaparse") {
+        subtitle_inputs.extend(["ssa", "ass"].map(str::to_owned));
+    }
+    if available("ttmlparse") {
+        subtitle_inputs.push("ttml".to_owned());
+    }
     Capabilities {
         gstreamer_version: gst::version_string().to_string(),
         cmaf: available("cmafmux"),
@@ -108,6 +121,8 @@ pub fn inspect_capabilities() -> Capabilities {
         .any(available),
         transmux_video_codecs,
         hdr_tone_mapping: HdrToneMapping::Unavailable,
+        subtitle_inputs,
+        subtitle_output: "webvtt".to_owned(),
         h264_encoders: encoder_candidates(TrackKind::Video),
         aac_encoders: encoder_candidates(TrackKind::Audio),
     }

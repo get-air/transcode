@@ -29,6 +29,12 @@ for element in h265parse h265timestamper av1parse; do
   fi
 done
 
+for element in subparse ssaparse ttmlparse; do
+  if gst-inspect-1.0 "$element" >/dev/null 2>&1; then
+    printf '%-18s available (optional text-subtitle input)\n' "$element"
+  fi
+done
+
 printf '\nH.264 encoders\n'
 gst-inspect-1.0 | rg '264.*enc|enc.*264' || true
 

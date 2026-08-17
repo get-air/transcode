@@ -15,6 +15,8 @@ The server prefers a zero-decode path. H.264/AAC are the conservative defaults; 
 - H.264/AAC transcoding with runtime-ranked hardware encoders and automatic fallback.
 - Default 1080p output ceiling without upscaling smaller sources.
 - Exact discovered audio/video track selection by index through `uridecodebin3`.
+- Every discovered audio track exposed as an independent HLS rendition for instant player-side language switching.
+- Embedded or external SRT, WebVTT, SSA/ASS, TTML, and related text subtitles normalized to segmented WebVTT renditions for player-side enable/disable and switching.
 - Bounded remote-source I/O timeouts with one retry, preventing a stalled debrid origin from occupying a pipeline indefinitely.
 - Lazy random-access segment generation and immutable segment caching.
 - Idle-only adjacent-segment prefetch so sequential playback usually hits cache.
@@ -23,6 +25,7 @@ The server prefers a zero-decode path. H.264/AAC are the conservative defaults; 
 - Cache corruption detection and regeneration before serving.
 - Linux implementation plus platform-neutral Rust code paths for Windows and Android GStreamer distributions.
 - Metrics for generated, cached, transmuxed, transcoded, failed, cancelled, active, and peak-active work.
+- No production source downloader: local fixture generation and any downloaded samples are test-only.
 
 ## Runtime requirements
 
@@ -52,7 +55,7 @@ cargo run --release -- \
   --cache-dir .cache/air-transcode
 ```
 
-Register a source. Credentials belong in headers, not in the TV- or browser-facing HLS URL:
+Register a source. Credentials belong in headers, not in the TV- or browser-facing HLS URL. The server reads the source on demand and never materializes the complete input as a product feature:
 
 ```bash
 curl http://127.0.0.1:11471/v1/sessions \
@@ -66,16 +69,24 @@ curl http://127.0.0.1:11471/v1/sessions \
       "transmux": true,
       "max_width": 1920,
       "max_height": 1080,
-      "video_codecs": ["h264"]
-    }
+      "video_codecs": ["h264"],
+      "audio_track_index": 1,
+      "subtitle_track_index": 3
+    },
+    "subtitles": [{
+      "source": { "url": "https://media.example/subtitles/en.srt" },
+      "name": "English CC",
+      "language": "en",
+      "offset_ms": 0
+    }]
   }'
 ```
 
-Play the returned `master_url` with an HLS/MSE player such as hls.js. Only add `"h265"` or `"av1"` to `video_codecs` after checking the actual browser/device decoder. For HDR, passthrough preserves the encoded signal; this build reports `hdr_tone_mapping: "unavailable"` and will not pretend that an eight-bit color conversion is correct tone mapping.
+Play the returned `master_url` with an HLS/MSE player such as hls.js. Its audio and subtitle track lists map directly to the HLS rendition groups, so changing `audioTrack` or `subtitleTrack` does not recreate the server session. Only add `"h265"` or `"av1"` to `video_codecs` after checking the actual browser/device decoder. For HDR, passthrough preserves the encoded signal; this build reports `hdr_tone_mapping: "unavailable"` and will not pretend that an eight-bit color conversion is correct tone mapping.
 
 ## Test
 
-The end-to-end suite generates H.264/AAC, HEVC/AAC, AV1/AAC, VP9/Opus, and multi-audio fixtures; hosts them behind an authenticated byte-range HTTP origin; exercises random and concurrent requests; corrupts the cache deliberately; and decodes the conservative H.264/AAC result through GStreamer.
+The end-to-end suite locally generates H.264/AAC, HEVC/AAC, AV1/AAC, VP9/Opus, bilingual audio, and bilingual subtitle fixtures; hosts them behind an authenticated byte-range HTTP origin; switches rendition payloads; validates WebVTT timelines; exercises random and concurrent requests; corrupts the cache deliberately; and decodes the conservative H.264/AAC result through GStreamer.
 
 ```bash
 cargo fmt --all -- --check
@@ -88,7 +99,7 @@ See [API](docs/API.md), [architecture](docs/ARCHITECTURE.md), [compatibility](do
 
 ## Status
 
-This repository is under active development. The primary video and audio renditions are functional and tested. Indexed multi-audio/subtitle selection, exact arbitrary-keyframe transmux maps, Android packaging, and browser-matrix automation remain release gates rather than silently claimed support.
+This repository is under active development. Primary video plus indexed multi-audio and embedded/external text-subtitle renditions are functional and tested. Bitmap subtitles, exact arbitrary-keyframe transmux maps, Android packaging, and browser-matrix automation remain release gates rather than silently claimed support.
 
 ## License
 

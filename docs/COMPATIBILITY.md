@@ -5,6 +5,8 @@
 - HLS protocol version 7.
 - CMAF-compatible fragmented MP4.
 - Separate video and audio renditions.
+- Multiple named/language-tagged audio renditions with independent caches.
+- Multiple text-subtitle renditions normalized to segmented WebVTT.
 - H.264 AVC in `avc`/access-unit alignment by default.
 - Opt-in HEVC `hvc1` and AV1 OBU-stream CMAF passthrough for targets that declare those decoders.
 - AAC-LC raw access units, stereo at most.
@@ -22,6 +24,8 @@
 - Random access by requesting segment two before segment one.
 - Eight concurrent identical requests with one generation.
 - Exact selection between two AAC tracks with different encoded payloads.
+- Runtime switching between two audio and two subtitle renditions without recreating a session.
+- SRT-in-Matroska discovery, key-unit seeking, WebVTT conversion, later-segment timing, subtitle cache reuse, and invalid-index rejection.
 - Idle-only adjacent segment prefetch followed by a verified cache hit.
 - Encoded timestamp duration bounds independent of demuxer end-of-segment behavior.
 - CMAF box structure and decode-time validation.
@@ -54,7 +58,7 @@ Factory discovery is caps-based, so the server does not depend on a hard-coded A
 - Color-correct Dolby Vision/HDR10/HDR10+ to SDR tone mapping. Eight-bit conversion without tone mapping is not considered visually correct.
 - Explicit segment job leases so abandoned HTTP requests cancel immediately after a client disconnect.
 - Multiple selectable video/audio/subtitle renditions.
-- WebVTT conversion and subtitle playlists.
+- Bitmap subtitle support (PGS/VobSub/DVB) through a switchable overlay or OCR path; these are discovered but not advertised as WebVTT.
 - GStreamer Android distribution packaging and on-device MediaCodec tests.
 - Windows runner tests against official MSVC GStreamer binaries.
 - Chromium, Firefox, WebKit, Android WebView, and Safari/hls.js playback automation.
