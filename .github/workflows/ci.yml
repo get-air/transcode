@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    timeout-minutes: 30
+    steps:
+      - name: Install system dependencies
+        run: >-
+          pacman -Syu --noconfirm --needed
+          git rustup pkgconf clang ripgrep
+          gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad
+          gst-plugins-ugly gst-libav
+          gst-plugin-hlssink3 gst-plugin-isobmff
+
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.1 --profile minimal --component rustfmt,clippy
+
+      - name: Verify GStreamer runtime
+        run: ./scripts/check-runtime.sh
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test all targets
+        run: cargo test --all-targets --locked
+
+      - name: Build release binary and library
+        run: cargo build --release --all-targets --locked
+
+      - name: Verify crate package
+        run: cargo package --locked
