@@ -23,6 +23,12 @@ if gst-inspect-1.0 hlscmafsink >/dev/null 2>&1; then
   printf '%-18s available (optional)\n' hlscmafsink
 fi
 
+for element in h265parse h265timestamper av1parse; do
+  if gst-inspect-1.0 "$element" >/dev/null 2>&1; then
+    printf '%-18s available (optional modern-codec transmux)\n' "$element"
+  fi
+done
+
 printf '\nH.264 encoders\n'
 gst-inspect-1.0 | rg '264.*enc|enc.*264' || true
 

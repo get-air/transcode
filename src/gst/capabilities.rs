@@ -4,6 +4,8 @@ use serde::Serialize;
 
 use crate::hls::TrackKind;
 
+use super::VideoCodec;
+
 #[derive(Clone, Debug, Serialize)]
 pub struct EncoderCandidate {
     pub element: String,
@@ -17,8 +19,16 @@ pub struct Capabilities {
     pub cmaf: bool,
     pub hls_cmaf: bool,
     pub http: bool,
+    pub transmux_video_codecs: Vec<VideoCodec>,
+    pub hdr_tone_mapping: HdrToneMapping,
     pub h264_encoders: Vec<EncoderCandidate>,
     pub aac_encoders: Vec<EncoderCandidate>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HdrToneMapping {
+    Unavailable,
 }
 
 fn available(name: &str) -> bool {
@@ -77,11 +87,27 @@ fn software_preference(name: &str) -> u8 {
 
 #[must_use]
 pub fn inspect_capabilities() -> Capabilities {
+    let mut transmux_video_codecs = vec![VideoCodec::H264];
+    if available("h265parse") && available("h265timestamper") {
+        transmux_video_codecs.push(VideoCodec::H265);
+    }
+    if available("av1parse") {
+        transmux_video_codecs.push(VideoCodec::Av1);
+    }
     Capabilities {
         gstreamer_version: gst::version_string().to_string(),
         cmaf: available("cmafmux"),
         hls_cmaf: available("hlscmafsink"),
-        http: available("souphttpsrc") || available("reqwesthttpsrc"),
+        http: [
+            "souphttpsrc",
+            "reqwesthttpsrc",
+            "curlhttpsrc",
+            "neonhttpsrc",
+        ]
+        .into_iter()
+        .any(available),
+        transmux_video_codecs,
+        hdr_tone_mapping: HdrToneMapping::Unavailable,
         h264_encoders: encoder_candidates(TrackKind::Video),
         aac_encoders: encoder_candidates(TrackKind::Audio),
     }

@@ -23,6 +23,7 @@ use crate::{
     mp4::{split_cmaf, validate_init_segment, validate_media_segment},
 };
 
+use super::VideoCodec;
 use super::capabilities::encoder_candidates;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -44,6 +45,7 @@ pub struct SegmentRequest {
     pub cancellation: CancellationToken,
     pub video_dimensions: Option<(u32, u32)>,
     pub selected_stream_id: Option<String>,
+    pub transmux_video_codec: Option<VideoCodec>,
 }
 
 #[derive(Clone, Debug)]
@@ -140,7 +142,13 @@ fn generate_segment_once(
         && encoder_name.is_some_and(|name| name.starts_with("va"))
         && gst::ElementFactory::find("vapostproc").is_some();
     let desired_caps = match (request.track, request.mode, va_memory) {
-        (TrackKind::Video, PipelineMode::Transmux, _) => gst::Caps::builder("video/x-h264").build(),
+        (TrackKind::Video, PipelineMode::Transmux, _) => gst::Caps::builder(
+            request
+                .transmux_video_codec
+                .unwrap_or(VideoCodec::H264)
+                .caps_name(),
+        )
+        .build(),
         (TrackKind::Audio, PipelineMode::Transmux, _) => gst::Caps::builder("audio/mpeg")
             .field("mpegversion", 4_i32)
             .build(),
@@ -158,7 +166,7 @@ fn generate_segment_once(
         .property("caps", &desired_caps)
         .build()
         .map_err(|_| Error::MissingElement("uridecodebin3".to_owned()))?;
-    configure_source_headers(&source, request.headers.clone());
+    configure_source(&source, request.headers.clone(), request.timeout);
     configure_stream_selection(&source, request.track, request.selected_stream_id.clone());
     let queue = make("queue")?;
     let app_sink = gst::ElementFactory::make("appsink")
@@ -179,6 +187,7 @@ fn generate_segment_once(
         request.mode,
         encoder_name,
         request.video_dimensions,
+        request.transmux_video_codec,
     )?;
     for element in &chain {
         pipeline
@@ -259,8 +268,13 @@ fn generate_segment_once(
         .set_state(gst::State::Playing)
         .map_err(|error| Error::Pipeline(error.to_string()))?;
 
-    let encoded =
-        collect_encoded_track(&pipeline, &app_sink, request.timeout, &request.cancellation);
+    let encoded = collect_encoded_track(
+        &pipeline,
+        &app_sink,
+        request.segment.duration_ns,
+        request.timeout,
+        &request.cancellation,
+    );
     let _ = pipeline.set_state(gst::State::Null);
     let encoded = encoded?;
 
@@ -289,6 +303,7 @@ struct EncodedTrack {
 fn collect_encoded_track(
     pipeline: &gst::Pipeline,
     sink: &gst_app::AppSink,
+    target_duration_ns: u64,
     timeout: Duration,
     cancellation: &CancellationToken,
 ) -> Result<EncodedTrack> {
@@ -298,6 +313,7 @@ fn collect_encoded_track(
     let deadline = std::time::Instant::now() + timeout;
     let mut caps = None;
     let mut buffers = Vec::new();
+    let mut first_timestamp_ns = None;
     loop {
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
@@ -310,6 +326,21 @@ fn collect_encoded_track(
                 caps = sample.caps_owned();
             }
             if let Some(buffer) = sample.buffer_owned() {
+                let timestamp_ns = buffer
+                    .dts()
+                    .or_else(|| buffer.pts())
+                    .map(gst::ClockTime::nseconds);
+                if first_timestamp_ns.is_none() {
+                    first_timestamp_ns = timestamp_ns;
+                }
+                if timestamp_ns
+                    .zip(first_timestamp_ns)
+                    .is_some_and(|(timestamp, first)| {
+                        !buffers.is_empty() && timestamp.saturating_sub(first) >= target_duration_ns
+                    })
+                {
+                    break;
+                }
                 buffers.push(buffer);
             }
             continue;
@@ -428,16 +459,11 @@ fn build_track_chain(
     mode: PipelineMode,
     encoder_name: Option<&str>,
     video_dimensions: Option<(u32, u32)>,
+    transmux_video_codec: Option<VideoCodec>,
 ) -> Result<Vec<gst::Element>> {
     match (track, mode) {
         (TrackKind::Video, PipelineMode::Transmux) => {
-            let parser = make("h264parse")?;
-            parser.set_property("config-interval", -1_i32);
-            let caps = gst::Caps::builder("video/x-h264")
-                .field("stream-format", "avc")
-                .field("alignment", "au")
-                .build();
-            Ok(vec![parser, caps_filter(&caps)?])
+            build_video_transmux_chain(transmux_video_codec.unwrap_or(VideoCodec::H264))
         }
         (TrackKind::Audio, PipelineMode::Transmux) => {
             let parser = make("aacparse")?;
@@ -520,6 +546,41 @@ fn build_track_chain(
     }
 }
 
+fn build_video_transmux_chain(codec: VideoCodec) -> Result<Vec<gst::Element>> {
+    let (parser, caps, timestamper) = match codec {
+        VideoCodec::H264 => {
+            let parser = make("h264parse")?;
+            parser.set_property("config-interval", -1_i32);
+            let caps = gst::Caps::builder("video/x-h264")
+                .field("stream-format", "avc")
+                .field("alignment", "au")
+                .build();
+            (parser, caps, None)
+        }
+        VideoCodec::H265 => {
+            let parser = make("h265parse")?;
+            parser.set_property("config-interval", -1_i32);
+            let caps = gst::Caps::builder("video/x-h265")
+                .field("stream-format", "hvc1")
+                .field("alignment", "au")
+                .build();
+            (parser, caps, Some(make("h265timestamper")?))
+        }
+        VideoCodec::Av1 => {
+            let caps = gst::Caps::builder("video/x-av1")
+                .field("stream-format", "obu-stream")
+                .field("alignment", "tu")
+                .build();
+            (make("av1parse")?, caps, None)
+        }
+    };
+    let mut chain = vec![parser, caps_filter(&caps)?];
+    if let Some(timestamper) = timestamper {
+        chain.push(timestamper);
+    }
+    Ok(chain)
+}
+
 fn caps_filter(caps: &gst::Caps) -> Result<gst::Element> {
     gst::ElementFactory::make("capsfilter")
         .property("caps", caps)
@@ -568,10 +629,8 @@ fn cleanup_attempt_files(directory: &Path) -> Result<()> {
     Ok(())
 }
 
-fn configure_source_headers(source: &gst::Element, headers: BTreeMap<String, String>) {
-    if headers.is_empty() {
-        return;
-    }
+fn configure_source(source: &gst::Element, headers: BTreeMap<String, String>, timeout: Duration) {
+    let timeout_seconds = timeout.as_secs().clamp(1, 15) as u32;
     source.connect("source-setup", false, move |values| {
         let child = values
             .get(1)
@@ -582,6 +641,15 @@ fn configure_source_headers(source: &gst::Element, headers: BTreeMap<String, Str
                 structure.set(name, value.as_str());
             }
             child.set_property("extra-headers", structure);
+        }
+        if child.find_property("timeout").is_some() {
+            child.set_property("timeout", timeout_seconds);
+        }
+        if child.find_property("retries").is_some() {
+            child.set_property("retries", 1_i32);
+        }
+        if child.find_property("compress").is_some() {
+            child.set_property("compress", false);
         }
         None
     });

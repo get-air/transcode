@@ -20,8 +20,8 @@ use crate::{
     config::Config,
     error::{Error, Result},
     gst::{
-        MediaInfo, PipelineMode, ProbeRequest, SegmentArtifact, SegmentRequest, generate_segment,
-        probe,
+        MediaInfo, PipelineMode, ProbeRequest, SegmentArtifact, SegmentRequest, VideoCodec,
+        generate_segment, probe,
     },
     hls::{SegmentSpec, TrackKind, segment_map},
 };
@@ -54,6 +54,8 @@ pub struct OutputOptions {
     pub video_track_index: Option<usize>,
     #[serde(default)]
     pub audio_track_index: Option<usize>,
+    #[serde(default = "default_video_codecs")]
+    pub video_codecs: Vec<VideoCodec>,
 }
 
 impl Default for OutputOptions {
@@ -65,8 +67,13 @@ impl Default for OutputOptions {
             max_height: default_max_height(),
             video_track_index: None,
             audio_track_index: None,
+            video_codecs: default_video_codecs(),
         }
     }
+}
+
+fn default_video_codecs() -> Vec<VideoCodec> {
+    vec![VideoCodec::H264]
 }
 
 const fn default_true() -> bool {
@@ -87,7 +94,17 @@ pub struct SessionView {
     pub duration_ns: u64,
     pub seekable: bool,
     pub tracks: Vec<crate::gst::MediaTrack>,
+    pub renditions: Vec<RenditionView>,
     pub master_url: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RenditionView {
+    pub kind: TrackKind,
+    pub source_track_index: usize,
+    pub mode: PipelineMode,
+    pub output_codec: Option<String>,
+    pub hdr_passthrough: bool,
 }
 
 pub struct Session {
@@ -112,11 +129,33 @@ struct ActiveRequest {
 impl Session {
     #[must_use]
     pub fn view(&self) -> SessionView {
+        let renditions = [TrackKind::Video, TrackKind::Audio]
+            .into_iter()
+            .filter_map(|kind| {
+                let track = self.selected_track(kind)?;
+                let mode = self.mode(kind);
+                let output_codec = match (kind, mode) {
+                    (TrackKind::Video, PipelineMode::Transcode) => Some("avc1".to_owned()),
+                    (TrackKind::Audio, PipelineMode::Transcode) => Some("mp4a.40.2".to_owned()),
+                    (_, PipelineMode::Transmux) => track.rfc6381_codec.clone(),
+                };
+                Some(RenditionView {
+                    kind,
+                    source_track_index: track.index,
+                    mode,
+                    output_codec,
+                    hdr_passthrough: kind == TrackKind::Video
+                        && matches!(mode, PipelineMode::Transmux)
+                        && track.hdr_format.is_some(),
+                })
+            })
+            .collect();
         SessionView {
             id: self.id,
             duration_ns: self.media.duration_ns,
             seekable: self.media.seekable,
             tracks: self.media.tracks.clone(),
+            renditions,
             master_url: format!("/v1/sessions/{}/master.m3u8", self.id),
         }
     }
@@ -141,10 +180,15 @@ impl Session {
             return PipelineMode::Transcode;
         }
         let compatible = self.selected_track(kind).is_some_and(|track| {
-            track.web_compatible
-                && (kind != TrackKind::Video
-                    || track.width.unwrap_or(0) <= self.output.max_width
-                        && track.height.unwrap_or(0) <= self.output.max_height)
+            let codec_compatible = track.web_compatible
+                || kind == TrackKind::Video
+                    && track
+                        .video_codec
+                        .is_some_and(|codec| self.output.video_codecs.contains(&codec));
+            let dimensions_compatible = kind != TrackKind::Video
+                || track.width.unwrap_or(0) <= self.output.max_width
+                    && track.height.unwrap_or(0) <= self.output.max_height;
+            codec_compatible && dimensions_compatible
         });
         if compatible {
             PipelineMode::Transmux
@@ -419,6 +463,9 @@ impl SessionManager {
             selected_stream_id: session
                 .selected_track(track)
                 .and_then(|track| track.stream_id.clone()),
+            transmux_video_codec: session
+                .selected_track(track)
+                .and_then(|track| track.video_codec),
         };
         let cancel_on_drop = cancellation.drop_guard();
         let permit = Arc::clone(&self.pipelines)

@@ -2,18 +2,20 @@
 
 `air-transcode` is a GStreamer-only HTTP VOD transmuxing and transcoding server. It turns seekable HTTP, HTTPS, and local media sources into browser-oriented HLS v7 with CMAF fragmented MP4 tracks.
 
-The server prefers a zero-decode path. Browser-safe H.264 and AAC tracks are parsed and transmuxed; incompatible tracks are decoded and transcoded to H.264/AAC. Encoder factories are discovered from the active GStreamer registry, hardware implementations are tried first, and runtime failures fall through to the next compatible encoder.
+The server prefers a zero-decode path. H.264/AAC are the conservative defaults; clients can explicitly declare HEVC or AV1 support and receive those tracks by direct CMAF transmux instead of an expensive H.264 reencode. Incompatible tracks are decoded and transcoded to H.264/AAC. Encoder factories are discovered from the active GStreamer registry, hardware implementations are tried first, and runtime failures fall through to the next compatible encoder.
 
 ## Current features
 
 - Authenticated remote HTTP sources with caller-provided headers kept in memory.
-- GStreamer discovery for duration, seekability, container, codecs, dimensions, channels, and language.
+- GStreamer discovery for duration, seekability, container, codecs, complete caps, bit depth, colorimetry, HDR signals, dimensions, channels, and language.
 - Complete VOD playlists with a stable duration and `#EXT-X-ENDLIST` from the first request.
 - HLS v7 CMAF output: independent video/audio init segments and `.m4s` media fragments.
 - Direct H.264/AAC transmuxing when profile, chroma format, bit depth, channel count, and requested dimensions are browser-compatible.
+- Opt-in HEVC and AV1 CMAF transmux for capable clients, including H.265 DTS reconstruction for Matroska sources.
 - H.264/AAC transcoding with runtime-ranked hardware encoders and automatic fallback.
 - Default 1080p output ceiling without upscaling smaller sources.
 - Exact discovered audio/video track selection by index through `uridecodebin3`.
+- Bounded remote-source I/O timeouts with one retry, preventing a stalled debrid origin from occupying a pipeline indefinitely.
 - Lazy random-access segment generation and immutable segment caching.
 - Idle-only adjacent-segment prefetch so sequential playback usually hits cache.
 - Correct per-segment `tfdt` offsets across independent seek pipelines.
@@ -63,16 +65,17 @@ curl http://127.0.0.1:11471/v1/sessions \
     "output": {
       "transmux": true,
       "max_width": 1920,
-      "max_height": 1080
+      "max_height": 1080,
+      "video_codecs": ["h264"]
     }
   }'
 ```
 
-Play the returned `master_url` with an HLS/MSE player such as hls.js. Native HTML media support alone varies by browser.
+Play the returned `master_url` with an HLS/MSE player such as hls.js. Only add `"h265"` or `"av1"` to `video_codecs` after checking the actual browser/device decoder. For HDR, passthrough preserves the encoded signal; this build reports `hdr_tone_mapping: "unavailable"` and will not pretend that an eight-bit color conversion is correct tone mapping.
 
 ## Test
 
-The end-to-end suite generates its own H.264/AAC MP4 and VP9/Opus Matroska fixtures, hosts them behind an authenticated byte-range HTTP origin, exercises random and concurrent requests, corrupts the cache deliberately, and decodes the resulting HLS through GStreamer.
+The end-to-end suite generates H.264/AAC, HEVC/AAC, AV1/AAC, VP9/Opus, and multi-audio fixtures; hosts them behind an authenticated byte-range HTTP origin; exercises random and concurrent requests; corrupts the cache deliberately; and decodes the conservative H.264/AAC result through GStreamer.
 
 ```bash
 cargo fmt --all -- --check

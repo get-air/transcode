@@ -337,6 +337,70 @@ async fn selects_an_exact_audio_track_by_discovered_index() -> TestResult {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn declared_modern_video_codecs_are_transmuxed_without_reencoding() -> TestResult {
+    air_transcode::initialize()?;
+    for (kind, codec) in [(FixtureKind::H265Aac, "h265"), (FixtureKind::Av1Aac, "av1")] {
+        let fixtures = tempfile::tempdir()?;
+        let fixture = fixtures.path().join(format!("{codec}.mkv"));
+        generate_fixture(&fixture, kind)?;
+        let origin_state = OriginState {
+            bytes: Arc::new(std::fs::read(&fixture)?),
+            range_requests: Arc::new(AtomicUsize::new(0)),
+        };
+        let origin = Router::new()
+            .route("/media", get(origin_media))
+            .with_state(origin_state);
+        let (origin_url, origin_task) = spawn(origin).await?;
+        let (server_url, server_task, _cache) = spawn_transcoder().await?;
+        let client = reqwest::Client::new();
+        let session = create_session_with_output(
+            &client,
+            &server_url,
+            &origin_url,
+            json!({
+                "max_width": 1920,
+                "max_height": 1080,
+                "video_codecs": [codec]
+            }),
+        )
+        .await?;
+        assert_eq!(session["tracks"][0]["video_codec"], codec);
+        assert_eq!(session["renditions"][0]["mode"], "transmux");
+        assert_eq!(
+            session["renditions"][0]["output_codec"],
+            if codec == "h265" { "hvc1" } else { "av01" }
+        );
+        let id = json_string(&session, "id")?;
+        let init = fetch_bytes(
+            &client,
+            format!("{server_url}/v1/sessions/{id}/video/init.mp4"),
+        )
+        .await
+        .map_err(|error| io::Error::other(format!("{codec} init failed: {error}")))?;
+        let media = fetch_bytes(
+            &client,
+            format!("{server_url}/v1/sessions/{id}/video/segments/1"),
+        )
+        .await
+        .map_err(|error| io::Error::other(format!("{codec} media failed: {error}")))?;
+        validate_init_segment(&init)?;
+        validate_media_segment(&media)?;
+        let metrics: Value = client
+            .get(format!("{server_url}/v1/metrics"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(metrics["transmux_segments"], 1);
+        assert_eq!(metrics["transcode_segments"], 0);
+        origin_task.abort();
+        server_task.abort();
+    }
+    Ok(())
+}
+
 async fn create_session(
     client: &reqwest::Client,
     server_url: &str,
@@ -467,6 +531,8 @@ async fn origin_media(
 #[derive(Clone, Copy)]
 enum FixtureKind {
     H264Aac,
+    H265Aac,
+    Av1Aac,
     Vp9Opus,
     MultiAac,
 }
@@ -486,6 +552,14 @@ fn generate_fixture(path: &Path, kind: FixtureKind) -> TestResult {
             "mp4mux name=mux ! filesink location={} videotestsrc num-buffers=180 pattern=smpte horizontal-speed=3 ! video/x-raw,format=I420,width=320,height=180,framerate=30/1 ! x264enc speed-preset=ultrafast tune=zerolatency key-int-max=30 bframes=0 byte-stream=false ! h264parse ! queue ! mux.",
             path.display()
         ),
+        FixtureKind::H265Aac => format!(
+            "matroskamux name=mux ! filesink location={} videotestsrc num-buffers=90 pattern=smpte horizontal-speed=3 ! video/x-raw,format=I420,width=320,height=180,framerate=30/1 ! x265enc speed-preset=ultrafast tune=zerolatency key-int-max=30 ! h265parse ! queue ! mux.",
+            path.display()
+        ),
+        FixtureKind::Av1Aac => format!(
+            "matroskamux name=mux ! filesink location={} videotestsrc num-buffers=60 pattern=ball animation-mode=frames ! video/x-raw,format=I420,width=320,height=180,framerate=30/1 ! av1enc cpu-used=8 threads=4 keyframe-max-dist=30 ! av1parse ! queue ! mux.",
+            path.display()
+        ),
         FixtureKind::Vp9Opus => format!(
             "matroskamux name=mux ! filesink location={} videotestsrc num-buffers=180 pattern=ball animation-mode=frames ! video/x-raw,width=320,height=180,framerate=30/1 ! vp9enc deadline=1 keyframe-max-dist=30 ! queue ! mux.",
             path.display()
@@ -497,6 +571,9 @@ fn generate_fixture(path: &Path, kind: FixtureKind) -> TestResult {
     let audio = match kind {
         FixtureKind::H264Aac => {
             "audiotestsrc num-buffers=282 wave=white-noise ! audio/x-raw,rate=48000,channels=2 ! avenc_aac ! aacparse ! queue ! mux."
+        }
+        FixtureKind::H265Aac | FixtureKind::Av1Aac => {
+            "audiotestsrc num-buffers=141 wave=white-noise ! audio/x-raw,rate=48000,channels=2 ! avenc_aac ! aacparse ! queue ! mux."
         }
         FixtureKind::Vp9Opus => {
             "audiotestsrc num-buffers=282 wave=ticks ! audio/x-raw,rate=48000,channels=2 ! opusenc ! queue ! mux."

@@ -40,12 +40,13 @@ Returns in-process scheduling counters. No source URL or header value is include
     "max_width": 1920,
     "max_height": 1080,
     "video_track_index": 0,
-    "audio_track_index": 1
+    "audio_track_index": 1,
+    "video_codecs": ["h264", "av1"]
   }
 }
 ```
 
-The response contains an opaque UUID, nanosecond duration, seekability, discovered tracks, RFC 6381 codec identifiers when available, and a relative master playlist URL. Source headers are never serialized back to the client.
+The response contains an opaque UUID, nanosecond duration, seekability, discovered tracks, selected rendition decisions, RFC 6381 codec identifiers when available, and a relative master playlist URL. Each rendition reports its source track index, `transmux`/`transcode` mode, output codec, and whether discovered HDR metadata is being preserved by passthrough. Source headers are never serialized back to the client.
 
 Input constraints:
 
@@ -53,7 +54,10 @@ Input constraints:
 - Headers: at most 64 valid HTTP fields and 64 KiB total.
 - Output dimensions: both at least two pixels.
 - Selected track indexes must identify a discovered track of the corresponding kind.
+- `video_codecs` is the target's declared decode surface. It defaults to `["h264"]`; accepted values are `h264`, `h265`, and `av1`. A matching source is transmuxed only when it also fits the requested dimensions.
 - A finite duration is required. Unknown-duration streams are rejected as non-VOD.
+
+Track metadata includes the codec family, full GStreamer caps, bit depth, colorimetry, and any HDR format discoverable from negotiated caps. Dolby Vision and HDR10+ bitstream metadata may require deeper parsing and is not guessed from filenames.
 
 ## `GET /v1/sessions/{id}`
 

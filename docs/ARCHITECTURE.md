@@ -22,7 +22,7 @@ segment request
   -> acquire global pipeline permit
   -> seek remote source to bounded interval
   -> parse/remux OR decode/convert/encode
-  -> appsink encoded buffers
+  -> appsink encoded buffers, independently capped by timestamp duration
   -> normalize local timestamps
   -> appsrc -> cmafmux -> filesink
   -> split complete CMAF into init + media sections
@@ -33,7 +33,9 @@ segment request
 
 ## Media decisions
 
-Video is transmuxable only when it is H.264 baseline, constrained-baseline, main, or high profile; 4:2:0; eight-bit; and within the requested dimensions. Audio is transmuxable only when it is MPEG-4 AAC with no more than two channels. Otherwise the track is transcoded.
+H.264 video is transmuxable by default only when it is baseline, constrained-baseline, main, or high profile; 4:2:0; eight-bit; and within the requested dimensions. A client may also declare HEVC or AV1 decoding support; a matching track within the requested dimensions is then parsed and transmuxed without decoding. H.265 passes through `h265timestamper` so Matroska presentation timestamps become valid CMAF decode timestamps. Audio is transmuxable only when it is MPEG-4 AAC with no more than two channels. Otherwise the track is transcoded.
+
+The inspected Stremio server bundle defaults its HLS transmux surface to H.264/AAC. Its H.264 transcode path labels/converts output as BT.709 but does not include a real tone-mapping stage. Air does not treat that metadata rewrite as HDR conversion: HEVC/AV1 passthrough preserves HDR for capable targets, while color-correct HDR-to-SDR remains an explicit release gate and `GET /v1/capabilities` reports `hdr_tone_mapping: "unavailable"`.
 
 Encoder selection is registry-driven rather than operating-system-name-driven. Factories are filtered by output caps, hardware implementations sort first, and each candidate is attempted until one qualifies under the real pipeline. This also finds Android MediaCodec factories whose names are device-specific.
 
@@ -42,6 +44,8 @@ Encoder selection is registry-driven rather than operating-system-name-driven. F
 ## Concurrency and cancellation
 
 A Tokio semaphore bounds native pipelines. A per-session/track/sequence mutex prevents duplicate work. Requests more than two segments away cancel older work for that track; cancellation is checked during preroll, state transitions, encoder fallback, and bus waits. All encoder attempts share one total deadline rather than multiplying the timeout by the number of candidates. HTTP client disconnect detection still needs an explicit job/lease protocol because Hyper can keep the service future alive after the socket closes.
+
+Remote GStreamer HTTP sources use bounded blocking-I/O timeouts, one retry, and disabled content compression so range semantics remain predictable. Encoded collection also stops at the requested fragment duration even if a demuxer ignores the seek's stop boundary. Together these keep unhealthy debrid origins and malformed timelines from monopolizing a pipeline permit.
 
 One adjacent segment is scheduled after a short delay only when a permit is idle. Prefetched work is marked so it cannot recursively walk the full title, and active requests always prevent new idle prefetch from starting.
 
