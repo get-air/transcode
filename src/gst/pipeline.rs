@@ -2,7 +2,10 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -40,6 +43,7 @@ pub struct SegmentRequest {
     pub timeout: Duration,
     pub cancellation: CancellationToken,
     pub video_dimensions: Option<(u32, u32)>,
+    pub selected_stream_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -148,14 +152,14 @@ fn generate_segment_once(
         }
         (TrackKind::Audio, PipelineMode::Transcode, _) => gst::Caps::builder("audio/x-raw").build(),
     };
-    let source = gst::ElementFactory::make("uridecodebin")
+    let source = gst::ElementFactory::make("uridecodebin3")
         .name("source")
         .property("uri", request.source.as_str())
         .property("caps", &desired_caps)
-        .property("expose-all-streams", false)
         .build()
-        .map_err(|_| Error::MissingElement("uridecodebin".to_owned()))?;
+        .map_err(|_| Error::MissingElement("uridecodebin3".to_owned()))?;
     configure_source_headers(&source, request.headers.clone());
+    configure_stream_selection(&source, request.track, request.selected_stream_id.clone());
     let queue = make("queue")?;
     let app_sink = gst::ElementFactory::make("appsink")
         .name("encoded-sink")
@@ -580,6 +584,32 @@ fn configure_source_headers(source: &gst::Element, headers: BTreeMap<String, Str
             child.set_property("extra-headers", structure);
         }
         None
+    });
+}
+
+fn configure_stream_selection(
+    source: &gst::Element,
+    track: TrackKind,
+    selected_stream_id: Option<String>,
+) {
+    let selected = Arc::new(AtomicBool::new(false));
+    source.connect("select-stream", false, move |values| {
+        let stream = values
+            .get(2)
+            .and_then(|value| value.get::<gst::Stream>().ok())?;
+        let wanted = match track {
+            TrackKind::Video => gst::StreamType::VIDEO,
+            TrackKind::Audio => gst::StreamType::AUDIO,
+        };
+        let id_matches = selected_stream_id
+            .as_deref()
+            .is_none_or(|selected| stream.stream_id().as_deref() == Some(selected));
+        let should_select = stream.stream_type().contains(wanted)
+            && id_matches
+            && selected
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+        Some(i32::from(should_select).to_value())
     });
 }
 

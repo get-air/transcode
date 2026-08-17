@@ -13,7 +13,9 @@ The server prefers a zero-decode path. Browser-safe H.264 and AAC tracks are par
 - Direct H.264/AAC transmuxing when profile, chroma format, bit depth, channel count, and requested dimensions are browser-compatible.
 - H.264/AAC transcoding with runtime-ranked hardware encoders and automatic fallback.
 - Default 1080p output ceiling without upscaling smaller sources.
+- Exact discovered audio/video track selection by index through `uridecodebin3`.
 - Lazy random-access segment generation and immutable segment caching.
+- Idle-only adjacent-segment prefetch so sequential playback usually hits cache.
 - Correct per-segment `tfdt` offsets across independent seek pipelines.
 - Duplicate-request coalescing, bounded concurrency, far-seek cancellation, session TTLs, and bounded per-session caches.
 - Cache corruption detection and regeneration before serving.

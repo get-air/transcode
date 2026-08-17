@@ -19,6 +19,8 @@
 - Ten-bit 4:4:4 H.264 incompatibility classification.
 - Random access by requesting segment two before segment one.
 - Eight concurrent identical requests with one generation.
+- Exact selection between two AAC tracks with different encoded payloads.
+- Idle-only adjacent segment prefetch followed by a verified cache hit.
 - CMAF box structure and decode-time validation.
 - Full master-playlist decode through GStreamer's HLS player.
 - Deliberately corrupted cache detection and repair.

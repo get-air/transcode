@@ -2,7 +2,7 @@
 set -euo pipefail
 
 required=(
-  uridecodebin
+  uridecodebin3
   souphttpsrc
   h264parse
   aacparse

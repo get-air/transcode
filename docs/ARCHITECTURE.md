@@ -37,9 +37,13 @@ Video is transmuxable only when it is H.264 baseline, constrained-baseline, main
 
 Encoder selection is registry-driven rather than operating-system-name-driven. Factories are filtered by output caps, hardware implementations sort first, and each candidate is attempted until one qualifies under the real pipeline. This also finds Android MediaCodec factories whose names are device-specific.
 
+`uridecodebin3` receives the selected discovered stream ID and rejects every other stream in its `select-stream` callback. This prevents multilingual sources from instantiating unused decoders and makes the single video/audio HLS renditions deterministic.
+
 ## Concurrency and cancellation
 
 A Tokio semaphore bounds native pipelines. A per-session/track/sequence mutex prevents duplicate work. Requests more than two segments away cancel older work for that track; cancellation is checked during preroll, state transitions, encoder fallback, and bus waits. All encoder attempts share one total deadline rather than multiplying the timeout by the number of candidates. HTTP client disconnect detection still needs an explicit job/lease protocol because Hyper can keep the service future alive after the socket closes.
+
+One adjacent segment is scheduled after a short delay only when a permit is idle. Prefetched work is marked so it cannot recursively walk the full title, and active requests always prevent new idle prefetch from starting.
 
 ## Cache integrity
 

@@ -20,6 +20,7 @@ pub struct ProbeRequest {
 #[derive(Clone, Debug, Serialize)]
 pub struct MediaTrack {
     pub index: usize,
+    pub stream_id: Option<String>,
     pub kind: String,
     pub codec: Option<String>,
     pub rfc6381_codec: Option<String>,
@@ -106,6 +107,7 @@ fn collect_streams(stream: &gst_pbutils::DiscovererStreamInfo, tracks: &mut Vec<
         return;
     }
 
+    let stream_id = stream.stream_id().map(|value| value.to_string());
     let caps = stream.caps();
     let caps_string = caps
         .as_ref()
@@ -144,6 +146,7 @@ fn collect_streams(stream: &gst_pbutils::DiscovererStreamInfo, tracks: &mut Vec<
             });
         tracks.push(MediaTrack {
             index: tracks.len(),
+            stream_id,
             kind: "video".to_owned(),
             codec,
             rfc6381_codec: caps
@@ -172,6 +175,7 @@ fn collect_streams(stream: &gst_pbutils::DiscovererStreamInfo, tracks: &mut Vec<
             });
         tracks.push(MediaTrack {
             index: tracks.len(),
+            stream_id,
             kind: "audio".to_owned(),
             codec,
             rfc6381_codec: web_compatible.then(|| "mp4a.40.2".to_owned()),

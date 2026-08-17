@@ -38,7 +38,9 @@ Returns in-process scheduling counters. No source URL or header value is include
     "transmux": true,
     "force_transcode": false,
     "max_width": 1920,
-    "max_height": 1080
+    "max_height": 1080,
+    "video_track_index": 0,
+    "audio_track_index": 1
   }
 }
 ```
@@ -50,6 +52,7 @@ Input constraints:
 - URL: at most 16 KiB; `http`, `https`, and `file` are understood by the media layer.
 - Headers: at most 64 valid HTTP fields and 64 KiB total.
 - Output dimensions: both at least two pixels.
+- Selected track indexes must identify a discovered track of the corresponding kind.
 - A finite duration is required. Unknown-duration streams are rejected as non-VOD.
 
 ## `GET /v1/sessions/{id}`
@@ -68,4 +71,4 @@ Destroys the session and its recoverable segment cache.
 - `GET /v1/sessions/{id}/{track}/init.mp4`
 - `GET /v1/sessions/{id}/{track}/segments/{sequence}`
 
-Media playlists are HLS v7 VOD playlists. Init and media responses are immutable for a session. Segment endpoints coalesce duplicate requests and may return `408 cancelled` if the viewer makes a far seek and the work is no longer useful.
+Media playlists are HLS v7 VOD playlists. Init and media responses are immutable for a session. Segment endpoints coalesce duplicate requests and may return `408 cancelled` if the viewer makes a far seek and the work is no longer useful. After a successful request, the next segment is prefetched only when a pipeline permit remains idle.

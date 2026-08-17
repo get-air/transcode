@@ -50,6 +50,10 @@ pub struct OutputOptions {
     pub max_width: u32,
     #[serde(default = "default_max_height")]
     pub max_height: u32,
+    #[serde(default)]
+    pub video_track_index: Option<usize>,
+    #[serde(default)]
+    pub audio_track_index: Option<usize>,
 }
 
 impl Default for OutputOptions {
@@ -59,6 +63,8 @@ impl Default for OutputOptions {
             force_transcode: false,
             max_width: default_max_width(),
             max_height: default_max_height(),
+            video_track_index: None,
+            audio_track_index: None,
         }
     }
 }
@@ -92,6 +98,7 @@ pub struct Session {
     pub segments: Vec<SegmentSpec>,
     pub directory: PathBuf,
     segment_locks: DashMap<(TrackKind, u32), Arc<tokio::sync::Mutex<()>>>,
+    prefetch_suppressed: DashMap<(TrackKind, u32), ()>,
     active_requests: Mutex<HashMap<TrackKind, Vec<ActiveRequest>>>,
     touched: Mutex<Instant>,
 }
@@ -125,10 +132,7 @@ impl Session {
 
     #[must_use]
     pub fn has_track(&self, kind: TrackKind) -> bool {
-        self.media
-            .tracks
-            .iter()
-            .any(|track| track.kind == kind.as_str())
+        self.selected_track(kind).is_some()
     }
 
     #[must_use]
@@ -136,17 +140,12 @@ impl Session {
         if self.output.force_transcode || !self.output.transmux {
             return PipelineMode::Transcode;
         }
-        let compatible = self
-            .media
-            .tracks
-            .iter()
-            .find(|track| track.kind == kind.as_str())
-            .is_some_and(|track| {
-                track.web_compatible
-                    && (kind != TrackKind::Video
-                        || track.width.unwrap_or(0) <= self.output.max_width
-                            && track.height.unwrap_or(0) <= self.output.max_height)
-            });
+        let compatible = self.selected_track(kind).is_some_and(|track| {
+            track.web_compatible
+                && (kind != TrackKind::Video
+                    || track.width.unwrap_or(0) <= self.output.max_width
+                        && track.height.unwrap_or(0) <= self.output.max_height)
+        });
         if compatible {
             PipelineMode::Transmux
         } else {
@@ -156,11 +155,7 @@ impl Session {
 
     #[must_use]
     pub fn video_output_dimensions(&self) -> Option<(u32, u32)> {
-        let track = self
-            .media
-            .tracks
-            .iter()
-            .find(|track| track.kind == "video")?;
+        let track = self.selected_track(TrackKind::Video)?;
         let width = track.width?;
         let height = track.height?;
         if width <= self.output.max_width && height <= self.output.max_height {
@@ -193,15 +188,20 @@ impl Session {
             if matches!(self.mode(kind), PipelineMode::Transcode) {
                 return None;
             }
-            codecs.push(
-                self.media
-                    .tracks
-                    .iter()
-                    .find(|track| track.kind == kind.as_str())
-                    .and_then(|track| track.rfc6381_codec.clone())?,
-            );
+            codecs.push(self.selected_track(kind)?.rfc6381_codec.clone()?);
         }
         (!codecs.is_empty()).then(|| codecs.join(","))
+    }
+
+    #[must_use]
+    pub fn selected_track(&self, kind: TrackKind) -> Option<&crate::gst::MediaTrack> {
+        let requested_index = match kind {
+            TrackKind::Video => self.output.video_track_index,
+            TrackKind::Audio => self.output.audio_track_index,
+        };
+        self.media.tracks.iter().find(|track| {
+            track.kind == kind.as_str() && requested_index.is_none_or(|index| track.index == index)
+        })
     }
 }
 
@@ -305,6 +305,7 @@ impl SessionManager {
         let media = tokio::task::spawn_blocking(move || probe(&probe_request))
             .await
             .map_err(|error| Error::Task(error.to_string()))??;
+        validate_track_selection(&media, &request.output)?;
         let id = Uuid::new_v4();
         let directory = self.config.cache_dir.join(id.to_string());
         std::fs::create_dir_all(&directory)?;
@@ -317,6 +318,7 @@ impl SessionManager {
             media,
             directory,
             segment_locks: DashMap::new(),
+            prefetch_suppressed: DashMap::new(),
             active_requests: Mutex::new(HashMap::new()),
             touched: Mutex::new(Instant::now()),
         });
@@ -361,6 +363,7 @@ impl SessionManager {
     ///
     /// Returns an error for unknown tracks or segments, scheduler failures, or
     /// any pipeline/media-processing failure.
+    #[allow(clippy::too_many_lines)]
     pub async fn segment(
         &self,
         session: Arc<Session>,
@@ -413,6 +416,9 @@ impl SessionManager {
             timeout: Duration::from_secs(60),
             cancellation: cancellation.clone(),
             video_dimensions: session.video_output_dimensions(),
+            selected_stream_id: session
+                .selected_track(track)
+                .and_then(|track| track.stream_id.clone()),
         };
         let cancel_on_drop = cancellation.drop_guard();
         let permit = Arc::clone(&self.pipelines)
@@ -463,7 +469,33 @@ impl SessionManager {
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
+        let suppress_prefetch = session
+            .prefetch_suppressed
+            .remove(&(track, sequence))
+            .is_some();
+        if !suppress_prefetch
+            && result.is_ok()
+            && session
+                .segments
+                .iter()
+                .any(|segment| segment.sequence == sequence.saturating_add(1))
+        {
+            self.spawn_prefetch(Arc::clone(&session), track, sequence.saturating_add(1));
+        }
         result
+    }
+
+    fn spawn_prefetch(&self, session: Arc<Session>, track: TrackKind, sequence: u32) {
+        session.prefetch_suppressed.insert((track, sequence), ());
+        let manager = self.clone();
+        let _prefetch = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if manager.pipelines.available_permits() == 0 {
+                session.prefetch_suppressed.remove(&(track, sequence));
+                return;
+            }
+            let _ = Box::pin(manager.segment(Arc::clone(&session), track, sequence)).await;
+        });
     }
 
     #[must_use]
@@ -549,6 +581,26 @@ fn validate_source(source: &Source) -> Result<()> {
         return Err(Error::InvalidSource(
             "source headers exceed 64 KiB".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_track_selection(media: &MediaInfo, output: &OutputOptions) -> Result<()> {
+    for (kind, index) in [
+        (TrackKind::Video, output.video_track_index),
+        (TrackKind::Audio, output.audio_track_index),
+    ] {
+        if let Some(index) = index
+            && !media
+                .tracks
+                .iter()
+                .any(|track| track.index == index && track.kind == kind.as_str())
+        {
+            return Err(Error::InvalidOutput(format!(
+                "track index {index} is not a {} track",
+                kind.as_str()
+            )));
+        }
     }
     Ok(())
 }

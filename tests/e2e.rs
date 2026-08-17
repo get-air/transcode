@@ -243,10 +243,113 @@ async fn remote_vp9_opus_is_transcoded_to_web_cmaf() -> TestResult {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn selects_an_exact_audio_track_by_discovered_index() -> TestResult {
+    air_transcode::initialize()?;
+    let fixtures = tempfile::tempdir()?;
+    let fixture = fixtures.path().join("multi-audio.mp4");
+    generate_fixture(&fixture, FixtureKind::MultiAac)?;
+    let origin_state = OriginState {
+        bytes: Arc::new(std::fs::read(&fixture)?),
+        range_requests: Arc::new(AtomicUsize::new(0)),
+    };
+    let origin = Router::new()
+        .route("/media", get(origin_media))
+        .with_state(origin_state);
+    let (origin_url, origin_task) = spawn(origin).await?;
+    let (server_url, server_task, _cache) = spawn_transcoder().await?;
+    let client = reqwest::Client::new();
+
+    let default_session = create_session(&client, &server_url, &origin_url).await?;
+    let audio_indices = default_session["tracks"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("session tracks are not an array"))?
+        .iter()
+        .filter(|track| track["kind"] == "audio")
+        .filter_map(|track| track["index"].as_u64())
+        .collect::<Vec<_>>();
+    assert_eq!(audio_indices.len(), 2);
+    let default_id = json_string(&default_session, "id")?;
+    let default_audio = fetch_bytes(
+        &client,
+        format!("{server_url}/v1/sessions/{default_id}/audio/segments/1"),
+    )
+    .await?;
+    let mut generated = 0_u64;
+    for _ in 0..50 {
+        let metrics: Value = client
+            .get(format!("{server_url}/v1/metrics"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        generated = metrics["generated_segments"].as_u64().unwrap_or(0);
+        if generated >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(generated >= 2, "adjacent segment was not prefetched");
+    let before: Value = client
+        .get(format!("{server_url}/v1/metrics"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let _prefetched = fetch_bytes(
+        &client,
+        format!("{server_url}/v1/sessions/{default_id}/audio/segments/2"),
+    )
+    .await?;
+    let after: Value = client
+        .get(format!("{server_url}/v1/metrics"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        after["cache_hits"].as_u64(),
+        before["cache_hits"].as_u64().map(|value| value + 1)
+    );
+
+    let selected_session = create_session_with_output(
+        &client,
+        &server_url,
+        &origin_url,
+        json!({ "audio_track_index": audio_indices[1] }),
+    )
+    .await?;
+    let selected_id = json_string(&selected_session, "id")?;
+    let selected_audio = fetch_bytes(
+        &client,
+        format!("{server_url}/v1/sessions/{selected_id}/audio/segments/1"),
+    )
+    .await?;
+    validate_media_segment(&default_audio)?;
+    validate_media_segment(&selected_audio)?;
+    assert!(media_data(&default_audio) != media_data(&selected_audio));
+
+    origin_task.abort();
+    server_task.abort();
+    Ok(())
+}
+
 async fn create_session(
     client: &reqwest::Client,
     server_url: &str,
     origin_url: &str,
+) -> TestResult<Value> {
+    create_session_with_output(client, server_url, origin_url, json!({ "max_width": 1920 })).await
+}
+
+async fn create_session_with_output(
+    client: &reqwest::Client,
+    server_url: &str,
+    origin_url: &str,
+    output: Value,
 ) -> TestResult<Value> {
     Ok(client
         .post(format!("{server_url}/v1/sessions"))
@@ -255,7 +358,7 @@ async fn create_session(
                 "url": format!("{origin_url}/media"),
                 "headers": { "Authorization": "Bearer fixture" }
             },
-            "output": { "max_width": 1920 }
+            "output": output
         }))
         .send()
         .await?
@@ -365,9 +468,19 @@ async fn origin_media(
 enum FixtureKind {
     H264Aac,
     Vp9Opus,
+    MultiAac,
 }
 
 fn generate_fixture(path: &Path, kind: FixtureKind) -> TestResult {
+    if matches!(kind, FixtureKind::MultiAac) {
+        return run_pipeline(
+            &format!(
+                "mp4mux name=mux ! filesink location={} audiotestsrc num-buffers=282 wave=sine freq=440 ! audio/x-raw,rate=48000,channels=2 ! avenc_aac ! aacparse ! queue ! mux. audiotestsrc num-buffers=282 wave=sine freq=880 ! audio/x-raw,rate=48000,channels=2 ! avenc_aac ! aacparse ! queue ! mux.",
+                path.display()
+            ),
+            Duration::from_secs(20),
+        );
+    }
     let mux_and_video = match kind {
         FixtureKind::H264Aac => format!(
             "mp4mux name=mux ! filesink location={} videotestsrc num-buffers=180 pattern=smpte horizontal-speed=3 ! video/x-raw,format=I420,width=320,height=180,framerate=30/1 ! x264enc speed-preset=ultrafast tune=zerolatency key-int-max=30 bframes=0 byte-stream=false ! h264parse ! queue ! mux.",
@@ -377,6 +490,9 @@ fn generate_fixture(path: &Path, kind: FixtureKind) -> TestResult {
             "matroskamux name=mux ! filesink location={} videotestsrc num-buffers=180 pattern=ball animation-mode=frames ! video/x-raw,width=320,height=180,framerate=30/1 ! vp9enc deadline=1 keyframe-max-dist=30 ! queue ! mux.",
             path.display()
         ),
+        FixtureKind::MultiAac => {
+            return Err(io::Error::other("multi-audio fixture returned too late").into());
+        }
     };
     let audio = match kind {
         FixtureKind::H264Aac => {
@@ -384,6 +500,9 @@ fn generate_fixture(path: &Path, kind: FixtureKind) -> TestResult {
         }
         FixtureKind::Vp9Opus => {
             "audiotestsrc num-buffers=282 wave=ticks ! audio/x-raw,rate=48000,channels=2 ! opusenc ! queue ! mux."
+        }
+        FixtureKind::MultiAac => {
+            return Err(io::Error::other("multi-audio fixture returned too late").into());
         }
     };
     run_pipeline(&format!("{mux_and_video} {audio}"), Duration::from_secs(20))
