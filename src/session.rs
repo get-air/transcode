@@ -282,7 +282,11 @@ impl Session {
                 continue;
             }
             if matches!(self.mode(kind), PipelineMode::Transcode) {
-                return None;
+                codecs.push(match kind {
+                    TrackKind::Video => "avc1.640028".to_owned(),
+                    TrackKind::Audio => "mp4a.40.2".to_owned(),
+                });
+                continue;
             }
             codecs.push(self.selected_track(kind)?.rfc6381_codec.clone()?);
         }

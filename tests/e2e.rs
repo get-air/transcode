@@ -213,7 +213,7 @@ async fn remote_vp9_opus_is_transcoded_to_web_cmaf() -> TestResult {
         .error_for_status()?
         .text()
         .await?;
-    assert!(!master.contains("CODECS="));
+    assert!(master.contains("CODECS=\"avc1.640028,mp4a.40.2\""));
 
     for track in ["video", "audio"] {
         let init = fetch_bytes(

@@ -10,6 +10,7 @@
 - H.264 AVC in `avc`/access-unit alignment by default.
 - Opt-in HEVC `hvc1` and AV1 OBU-stream CMAF passthrough for targets that declare those decoders.
 - AAC-LC raw access units, stereo at most.
+- Explicit RFC 6381 `CODECS` declarations for both direct and transcoded renditions.
 - Complete finite VOD duration and `ENDLIST`.
 - A keyframe at every video fragment boundary.
 - Monotonic `tfdt` across independently generated fragments.
