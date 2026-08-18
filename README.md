@@ -103,6 +103,7 @@ curl http://127.0.0.1:11471/v1/sessions \
       "max_width": 1920,
       "max_height": 1080,
       "video_codecs": ["h264"],
+      "hdr_formats": [],
       "audio_track_index": 1,
       "subtitle_track_index": 3
     },

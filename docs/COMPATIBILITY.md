@@ -11,6 +11,7 @@
 - Opt-in HEVC `hvc1` and validated eight-bit AV1 OBU-stream CMAF passthrough for targets that declare those decoders.
 - AAC-LC raw access units, stereo at most.
 - Explicit RFC 6381 `CODECS` declarations for both direct and transcoded renditions.
+- Explicit target HDR declarations. Unsupported HDR conversion is rejected while tone mapping is unavailable; it is never mislabeled as valid SDR.
 - Complete finite VOD duration and `ENDLIST`.
 - A keyframe at every video fragment boundary.
 - Monotonic `tfdt` across independently generated fragments.

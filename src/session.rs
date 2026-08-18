@@ -70,6 +70,9 @@ pub struct OutputOptions {
     pub subtitle_track_index: Option<usize>,
     #[serde(default = "default_video_codecs")]
     pub video_codecs: Vec<VideoCodec>,
+    /// HDR formats the target can render, for example `hdr10`.
+    #[serde(default)]
+    pub hdr_formats: Vec<String>,
 }
 
 impl Default for OutputOptions {
@@ -83,6 +86,7 @@ impl Default for OutputOptions {
             audio_track_index: None,
             subtitle_track_index: None,
             video_codecs: default_video_codecs(),
+            hdr_formats: Vec::new(),
         }
     }
 }
@@ -231,23 +235,7 @@ impl Session {
         }
         let compatible = self
             .track_by_index(kind.as_str(), index)
-            .is_some_and(|track| {
-                let codec_compatible = track.web_compatible
-                    || kind == TrackKind::Video
-                        && track.video_codec.is_some_and(|codec| {
-                            self.output.video_codecs.contains(&codec)
-                                // Real ten-bit Matroska AV1 sources currently hit a
-                                // GstBaseParse timestamp/flush bug during CMAF transmux.
-                                // Decode them through the H.264 fallback until isolated
-                                // worker coverage proves the direct path safe.
-                                && !(codec == VideoCodec::Av1
-                                    && track.bit_depth.unwrap_or(8) > 8)
-                        });
-                let dimensions_compatible = kind != TrackKind::Video
-                    || track.width.unwrap_or(0) <= self.output.max_width
-                        && track.height.unwrap_or(0) <= self.output.max_height;
-                codec_compatible && dimensions_compatible
-            });
+            .is_some_and(|track| track_is_compatible(track, kind, &self.output));
         if compatible {
             PipelineMode::Transmux
         } else {
@@ -502,6 +490,7 @@ impl SessionManager {
             external_subtitles.insert(index, subtitle);
         }
         validate_track_selection(&media, &request.output)?;
+        validate_hdr_output(&media, &request.output)?;
         let id = Uuid::new_v4();
         let directory = self.config.cache_dir.join(id.to_string());
         std::fs::create_dir_all(&directory)?;
@@ -957,4 +946,120 @@ fn validate_track_selection(media: &MediaInfo, output: &OutputOptions) -> Result
         }
     }
     Ok(())
+}
+
+fn track_is_compatible(
+    track: &crate::gst::MediaTrack,
+    kind: TrackKind,
+    output: &OutputOptions,
+) -> bool {
+    let codec_compatible = track.web_compatible
+        || kind == TrackKind::Video
+            && track.video_codec.is_some_and(|codec| {
+                codec != VideoCodec::H264
+                    && output.video_codecs.contains(&codec)
+                    // Real ten-bit Matroska AV1 takes the seek-safe H.264 path.
+                    && !(codec == VideoCodec::Av1 && track.bit_depth.unwrap_or(8) > 8)
+            });
+    let dimensions_compatible = kind != TrackKind::Video
+        || track.width.unwrap_or(0) <= output.max_width
+            && track.height.unwrap_or(0) <= output.max_height;
+    let hdr_compatible = kind != TrackKind::Video
+        || track.hdr_format.as_ref().is_none_or(|format| {
+            output
+                .hdr_formats
+                .iter()
+                .any(|supported| supported.eq_ignore_ascii_case(format))
+        });
+    codec_compatible && dimensions_compatible && hdr_compatible
+}
+
+fn validate_hdr_output(media: &MediaInfo, output: &OutputOptions) -> Result<()> {
+    let video = media.tracks.iter().find(|track| {
+        track.kind == "video"
+            && output
+                .video_track_index
+                .is_none_or(|index| track.index == index)
+    });
+    let Some((video, hdr_format)) =
+        video.and_then(|track| track.hdr_format.as_deref().map(|format| (track, format)))
+    else {
+        return Ok(());
+    };
+    let requires_transcode = output.force_transcode
+        || !output.transmux
+        || !track_is_compatible(video, TrackKind::Video, output);
+    if requires_transcode {
+        return Err(Error::InvalidOutput(format!(
+            "{hdr_format} video requires passthrough because HDR tone mapping is unavailable; declare target HDR support and compatible dimensions, or choose an SDR source"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OutputOptions, track_is_compatible, validate_hdr_output};
+    use crate::{
+        gst::{MediaInfo, MediaTrack, VideoCodec},
+        hls::TrackKind,
+    };
+
+    fn video(codec: VideoCodec, bit_depth: u32, hdr_format: Option<&str>) -> MediaTrack {
+        MediaTrack {
+            index: 0,
+            stream_id: Some("video-0".to_owned()),
+            kind: "video".to_owned(),
+            name: None,
+            codec: Some(codec.caps_name().to_owned()),
+            video_codec: Some(codec),
+            rfc6381_codec: Some(codec.rfc6381_fallback().to_owned()),
+            caps: None,
+            bit_depth: Some(bit_depth),
+            colorimetry: None,
+            hdr_format: hdr_format.map(ToOwned::to_owned),
+            language: None,
+            width: Some(3840),
+            height: Some(2160),
+            channels: None,
+            sample_rate: None,
+            web_compatible: false,
+        }
+    }
+
+    #[test]
+    fn nonstandard_h264_does_not_bypass_compatibility_checks() {
+        let output = OutputOptions {
+            max_width: 3840,
+            max_height: 2160,
+            ..OutputOptions::default()
+        };
+        assert!(!track_is_compatible(
+            &video(VideoCodec::H264, 10, None),
+            TrackKind::Video,
+            &output,
+        ));
+    }
+
+    #[test]
+    fn hdr_requires_declared_passthrough_and_source_dimensions() {
+        let track = video(VideoCodec::H265, 10, Some("hdr10"));
+        let media = MediaInfo {
+            duration_ns: 10_000_000_000,
+            seekable: true,
+            container: Some("matroska".to_owned()),
+            tracks: vec![track],
+        };
+        let mut output = OutputOptions {
+            max_width: 3840,
+            max_height: 2160,
+            video_codecs: vec![VideoCodec::H264, VideoCodec::H265],
+            ..OutputOptions::default()
+        };
+        assert!(validate_hdr_output(&media, &output).is_err());
+        output.hdr_formats.push("HDR10".to_owned());
+        assert!(validate_hdr_output(&media, &output).is_ok());
+        output.max_width = 1920;
+        assert!(validate_hdr_output(&media, &output).is_err());
+    }
 }
