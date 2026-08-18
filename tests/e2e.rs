@@ -916,8 +916,9 @@ fn generate_fixture(path: &Path, kind: FixtureKind) -> TestResult {
             gst_launch_path(path)
         ),
         FixtureKind::Av1Aac => format!(
-            "matroskamux name=mux ! filesink location={} videotestsrc num-buffers=60 pattern=ball animation-mode=frames ! video/x-raw,format=I420,width=320,height=180,framerate=30/1 ! av1enc cpu-used=8 threads=4 keyframe-max-dist=30 ! av1parse ! queue ! mux.",
-            gst_launch_path(path)
+            "matroskamux name=mux ! filesink location={} videotestsrc num-buffers=30 pattern=ball animation-mode=frames ! video/x-raw,format=I420,width=320,height=180,framerate=30/1 ! {} ! av1parse ! queue ! mux.",
+            gst_launch_path(path),
+            av1_fixture_encoder()?,
         ),
         FixtureKind::Vp9Opus => format!(
             "matroskamux name=mux ! filesink location={} videotestsrc num-buffers=180 pattern=ball animation-mode=frames ! video/x-raw,width=320,height=180,framerate=30/1 ! vp9enc deadline=1 keyframe-max-dist=30 ! queue ! mux.",
@@ -953,6 +954,13 @@ fn generate_fixture(path: &Path, kind: FixtureKind) -> TestResult {
 fn gst_launch_path(path: &Path) -> String {
     let normalized = path.to_string_lossy().replace('\\', "/");
     format!("\"{}\"", normalized.replace('"', "\\\""))
+}
+
+fn av1_fixture_encoder() -> TestResult<&'static str> {
+    ["av1enc", "svtav1enc", "rav1enc"]
+        .into_iter()
+        .find(|name| gst::ElementFactory::find(name).is_some())
+        .ok_or_else(|| io::Error::other("no AV1 encoder is installed for the test fixture").into())
 }
 
 async fn play_hls(uri: String) -> TestResult {
