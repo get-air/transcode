@@ -57,6 +57,30 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/metrics", get(metrics))
         .route("/v1/sessions", post(create_session))
         .route("/v1/sessions/{id}", get(get_session).delete(delete_session))
+        .merge(media_routes())
+        .layer(CatchPanicLayer::new())
+        .layer(TraceLayer::new_for_http())
+        .layer(api_cors())
+        .with_state(Arc::new(state))
+}
+
+/// Read-only media surface for a tokenized LAN cast listener.
+pub fn media_app(state: AppState) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .merge(media_routes())
+        .layer(CatchPanicLayer::new())
+        .layer(TraceLayer::new_for_http())
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([http::Method::GET]),
+        )
+        .with_state(Arc::new(state))
+}
+
+fn media_routes() -> Router<Arc<AppState>> {
+    Router::new()
         .route("/v1/sessions/{id}/master.m3u8", get(master))
         .route("/v1/sessions/{id}/video.m3u8", get(video_media))
         .route("/v1/sessions/{id}/audio.m3u8", get(audio_media))
@@ -85,15 +109,13 @@ pub fn app(state: AppState) -> Router {
             "/v1/sessions/{id}/{track}/segments/{sequence}",
             get(segment),
         )
-        .layer(CatchPanicLayer::new())
-        .layer(TraceLayer::new_for_http())
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods([http::Method::GET, http::Method::POST, http::Method::DELETE])
-                .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]),
-        )
-        .with_state(Arc::new(state))
+}
+
+fn api_cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([http::Method::GET, http::Method::POST, http::Method::DELETE])
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
 }
 
 #[derive(Serialize)]

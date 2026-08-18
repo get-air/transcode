@@ -1,6 +1,5 @@
-use air_transcode::{AppState, Config, app};
+use air_transcode::{Config, spawn_server};
 use clap::Parser;
-use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -14,16 +13,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .json()
         .init();
     let config = Config::parse();
-    air_transcode::initialize()?;
-    let state = AppState::new(config.clone())?;
-    if !state.capabilities.cmaf {
-        return Err("GStreamer cmafmux plugin is required".into());
-    }
-    let listener = TcpListener::bind(config.bind).await?;
-    info!(address = %config.bind, "air-transcode listening");
-    axum::serve(listener, app(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let server = spawn_server(config).await?;
+    info!(address = %server.address(), "air-transcode listening");
+    shutdown_signal().await;
+    server.shutdown().await?;
     Ok(())
 }
 

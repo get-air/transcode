@@ -61,7 +61,7 @@ Input constraints:
 - Headers: at most 64 valid HTTP fields and 64 KiB total.
 - Output dimensions: both at least two pixels.
 - Selected video, audio, and subtitle indexes must identify a discovered track of the corresponding kind. Audio and subtitle indexes choose defaults; every playable audio/text-subtitle track remains available for runtime HLS switching.
-- `video_codecs` is the target's declared decode surface. It defaults to `["h264"]`; accepted values are `h264`, `h265`, and `av1`. A matching source is transmuxed only when it also fits the requested dimensions.
+- `video_codecs` is the target's declared decode surface. It defaults to `["h264"]`; accepted values are `h264`, `h265`, and `av1`. A matching source is transmuxed only when it also fits the requested dimensions. Ten-bit Matroska AV1 is currently forced through the H.264 fallback after real-source validation exposed unsafe GStreamer parser behavior during random-access transmux.
 - A finite duration is required. Unknown-duration streams are rejected as non-VOD.
 - Up to 64 external text subtitles may be attached. Each uses the same validated source/header contract, a 1–256 character display name, optional language, and signed millisecond timing offset.
 

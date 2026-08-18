@@ -8,7 +8,7 @@
 - Multiple named/language-tagged audio renditions with independent caches.
 - Multiple text-subtitle renditions normalized to segmented WebVTT.
 - H.264 AVC in `avc`/access-unit alignment by default.
-- Opt-in HEVC `hvc1` and AV1 OBU-stream CMAF passthrough for targets that declare those decoders.
+- Opt-in HEVC `hvc1` and validated eight-bit AV1 OBU-stream CMAF passthrough for targets that declare those decoders.
 - AAC-LC raw access units, stereo at most.
 - Explicit RFC 6381 `CODECS` declarations for both direct and transcoded renditions.
 - Complete finite VOD duration and `ENDLIST`.
@@ -42,6 +42,15 @@ Two signed remote Matroska sources were exercised without persisting their URLs:
 
 - 3840×2160 HEVC with four stereo AAC tracks: full-duration probing, segment 1 and segment 700 random access, AAC transmux, HEVC-to-1920×1080 H.264 conversion, distinct media-payload validation, and complete HLS discovery passed. On the test RX 7900 XT host, four seconds of video took approximately 4.3–4.7 seconds after pipeline startup.
 - 3840×1600 Dolby Vision/HDR10+ Main-10 HEVC with ten 5.1 E-AC-3 tracks: duration and all tracks probe correctly, and GStreamer negotiates `vah265dec -> vapostproc -> vah264enc`. It still produces fewer than 96 frames in 30 seconds on the same host and is therefore a failed performance case, not claimed compatibility.
+
+## One-time headless Stremio validation (2026-08-18)
+
+Seven cached Torrentio/Torbox selections were chosen across H.264, HEVC/Dolby Vision, AV1/HDR, AAC, Opus, AC-3, E-AC-3, and TrueHD without persisting their resolver URLs. Six probed successfully; one community anime AV1 source failed discovery with a demux error and was treated as a failure rather than skipped.
+
+- AAC transmux and Opus, AC-3, E-AC-3, and TrueHD transcoding all emitted AAC-LC 48 kHz stereo CMAF. First-fragment generation measured approximately 0.27–3.47 seconds across six sources, and every output decoded through FFmpeg.
+- H.264 High 1920×1080 and HEVC Main-10 3840×1608 fragments transmuxed, parsed, and decoded successfully. Video and audio random-access requests around 196 seconds returned monotonic timestamps and completed in approximately 1.37–3.82 seconds.
+- A real ten-bit AV1 Matroska source exposed two GStreamer issues absent from generated fixtures: redundant parser timestamp destruction and a native `GstBaseParse` abort on flushing seeks. The safe H.264 fallback produces and decodes segment zero in about 0.62 seconds, but later random access currently returns a controlled media-processing error. Ten-bit AV1 random access remains a release blocker.
+- The run found and fixed a real AAC boundary bug: the collector compared only buffer start timestamps, so a final AAC frame crossing the four-second boundary caused a false timeout after 188 valid buffers. Collection now includes buffer duration and retains the boundary frame.
 
 ## Platform intent
 

@@ -48,6 +48,21 @@ pub struct Config {
 }
 
 impl Config {
+    /// Safe ephemeral loopback configuration for embedding in desktop applications.
+    #[must_use]
+    pub fn loopback(cache_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            cache_dir: cache_dir.into(),
+            segment_seconds: 4,
+            max_sessions: 16,
+            max_pipelines: 2,
+            max_cached_segments: 64,
+            session_ttl_seconds: 300,
+            probe_timeout_seconds: 20,
+        }
+    }
+
     #[must_use]
     pub const fn session_ttl(&self) -> Duration {
         Duration::from_secs(self.session_ttl_seconds)

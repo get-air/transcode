@@ -522,36 +522,44 @@ fn generate_segment_once(
     let start = gst::ClockTime::from_nseconds(request.segment.start_ns);
     let stop =
         gst::ClockTime::from_nseconds(request.segment.start_ns + request.segment.duration_ns);
-    let flags = match request.mode {
-        PipelineMode::Transmux => gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
-        PipelineMode::Transcode => gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+    let av1_video =
+        request.track == TrackKind::Video && request.transmux_video_codec == Some(VideoCodec::Av1);
+    let flags = match (request.mode, av1_video) {
+        // Each segment uses a fresh pipeline, so AV1 does not need a flushing
+        // seek. GstBaseParse can abort on a flush seek for real Matroska AV1.
+        (PipelineMode::Transmux, true) => gst::SeekFlags::KEY_UNIT,
+        (PipelineMode::Transcode, true) => gst::SeekFlags::ACCURATE,
+        (PipelineMode::Transmux, false) => gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+        (PipelineMode::Transcode, false) => gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
     };
-    let seek_pad = linked_source_pad.lock().clone().ok_or_else(|| {
-        Error::Pipeline("source did not expose the selected track pad".to_owned())
-    })?;
-    let seek_result = pipeline
-        .seek(
-            1.0,
-            flags,
-            gst::SeekType::Set,
-            start,
-            gst::SeekType::Set,
-            stop,
-        )
-        .is_ok()
-        || seek_pad.send_event(gst::event::Seek::new(
-            1.0,
-            flags,
-            gst::SeekType::Set,
-            start,
-            gst::SeekType::Set,
-            stop,
-        ));
-    if !seek_result {
-        let (_, current, pending) = pipeline.state(gst::ClockTime::ZERO);
-        return Err(Error::Pipeline(format!(
-            "source rejected segment seek; current={current:?}; pending={pending:?}"
-        )));
+    if request.segment.start_ns > 0 {
+        let seek_pad = linked_source_pad.lock().clone().ok_or_else(|| {
+            Error::Pipeline("source did not expose the selected track pad".to_owned())
+        })?;
+        let seek_result = pipeline
+            .seek(
+                1.0,
+                flags,
+                gst::SeekType::Set,
+                start,
+                gst::SeekType::Set,
+                stop,
+            )
+            .is_ok()
+            || seek_pad.send_event(gst::event::Seek::new(
+                1.0,
+                flags,
+                gst::SeekType::Set,
+                start,
+                gst::SeekType::Set,
+                stop,
+            ));
+        if !seek_result {
+            let (_, current, pending) = pipeline.state(gst::ClockTime::ZERO);
+            return Err(Error::Pipeline(format!(
+                "source rejected segment seek; current={current:?}; pending={pending:?}"
+            )));
+        }
     }
     pipeline
         .set_state(gst::State::Playing)
@@ -603,34 +611,45 @@ fn collect_encoded_track(
     let mut caps = None;
     let mut buffers = Vec::new();
     let mut first_timestamp_ns = None;
+    let mut last_timestamp_ns = None;
     loop {
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
         if std::time::Instant::now() >= deadline {
-            return Err(Error::Pipeline("pipeline timed out".to_owned()));
+            return Err(Error::Pipeline(format!(
+                "pipeline timed out collecting encoded media; buffers={}; first_timestamp_ns={first_timestamp_ns:?}; last_timestamp_ns={last_timestamp_ns:?}; caps_seen={}",
+                buffers.len(),
+                caps.is_some(),
+            )));
         }
         if let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_mseconds(100)) {
             if caps.is_none() {
                 caps = sample.caps_owned();
             }
             if let Some(buffer) = sample.buffer_owned() {
-                let timestamp_ns = buffer
-                    .dts()
-                    .or_else(|| buffer.pts())
-                    .map(gst::ClockTime::nseconds);
+                let timestamp_ns = match (buffer.dts(), buffer.pts()) {
+                    (Some(dts), Some(pts)) => Some(dts.max(pts).nseconds()),
+                    (Some(dts), None) => Some(dts.nseconds()),
+                    (None, Some(pts)) => Some(pts.nseconds()),
+                    (None, None) => None,
+                };
                 if first_timestamp_ns.is_none() {
                     first_timestamp_ns = timestamp_ns;
                 }
-                if timestamp_ns
-                    .zip(first_timestamp_ns)
-                    .is_some_and(|(timestamp, first)| {
-                        !buffers.is_empty() && timestamp.saturating_sub(first) >= target_duration_ns
-                    })
-                {
+                if timestamp_ns.is_some() {
+                    last_timestamp_ns = timestamp_ns;
+                }
+                let reaches_target = encoded_buffer_reaches_target(
+                    timestamp_ns,
+                    buffer.duration().map_or(0, gst::ClockTime::nseconds),
+                    first_timestamp_ns,
+                    target_duration_ns,
+                );
+                buffers.push(buffer);
+                if reaches_target {
                     break;
                 }
-                buffers.push(buffer);
             }
             continue;
         }
@@ -656,6 +675,19 @@ fn collect_encoded_track(
         ));
     }
     Ok(EncodedTrack { caps, buffers })
+}
+
+fn encoded_buffer_reaches_target(
+    timestamp_ns: Option<u64>,
+    duration_ns: u64,
+    first_timestamp_ns: Option<u64>,
+    target_duration_ns: u64,
+) -> bool {
+    timestamp_ns
+        .zip(first_timestamp_ns)
+        .is_some_and(|(timestamp, first)| {
+            timestamp.saturating_add(duration_ns).saturating_sub(first) >= target_duration_ns
+        })
 }
 
 fn mux_encoded_track(
@@ -1040,5 +1072,30 @@ fn wait_for_pipeline(
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encoded_buffer_reaches_target;
+
+    #[test]
+    fn encoded_buffer_duration_can_cross_segment_boundary() {
+        assert!(encoded_buffer_reaches_target(
+            Some(3_988_999_999),
+            21_333_333,
+            Some(0),
+            4_000_000_000,
+        ));
+    }
+
+    #[test]
+    fn encoded_buffer_before_segment_boundary_keeps_collecting() {
+        assert!(!encoded_buffer_reaches_target(
+            Some(3_900_000_000),
+            20_000_000,
+            Some(0),
+            4_000_000_000,
+        ));
     }
 }

@@ -6,11 +6,13 @@ pub mod error;
 pub mod gst;
 pub mod hls;
 pub mod mp4;
+pub mod server;
 pub mod session;
 
-pub use api::{AppState, app};
+pub use api::{AppState, app, media_app};
 pub use config::Config;
 pub use error::{Error, Result};
+pub use server::{EmbeddedCastHost, EmbeddedServer, spawn_server, spawn_tauri_host};
 
 /// Initialize `GStreamer` once for the current process.
 ///

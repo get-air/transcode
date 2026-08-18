@@ -2,7 +2,7 @@
 
 `air-transcode` is a GStreamer-only HTTP VOD transmuxing and transcoding server. It turns seekable HTTP, HTTPS, and local media sources into browser-oriented HLS v7 with CMAF fragmented MP4 tracks.
 
-The server prefers a zero-decode path. H.264/AAC are the conservative defaults; clients can explicitly declare HEVC or AV1 support and receive those tracks by direct CMAF transmux instead of an expensive H.264 reencode. Incompatible tracks are decoded and transcoded to H.264/AAC. Encoder factories are discovered from the active GStreamer registry, hardware implementations are tried first, and runtime failures fall through to the next compatible encoder.
+The server prefers a zero-decode path. H.264/AAC are the conservative defaults; clients can explicitly declare HEVC or validated eight-bit AV1 support and receive those tracks by direct CMAF transmux instead of an expensive H.264 reencode. Incompatible tracks are decoded and transcoded to H.264/AAC. Encoder factories are discovered from the active GStreamer registry, hardware implementations are tried first, and runtime failures fall through to the next compatible encoder.
 
 ## Current features
 
@@ -11,7 +11,7 @@ The server prefers a zero-decode path. H.264/AAC are the conservative defaults; 
 - Complete VOD playlists with a stable duration and `#EXT-X-ENDLIST` from the first request.
 - HLS v7 CMAF output: independent video/audio init segments and `.m4s` media fragments.
 - Direct H.264/AAC transmuxing when profile, chroma format, bit depth, channel count, and requested dimensions are browser-compatible.
-- Opt-in HEVC and AV1 CMAF transmux for capable clients, including H.265 DTS reconstruction for Matroska sources.
+- Opt-in HEVC and validated eight-bit AV1 CMAF transmux for capable clients, including H.265 DTS reconstruction for Matroska sources. Ten-bit Matroska AV1 currently takes the conservative H.264 path because real-source validation exposed a GStreamer parser seek defect.
 - H.264/AAC transcoding with runtime-ranked hardware encoders and automatic fallback.
 - Default 1080p output ceiling without upscaling smaller sources.
 - Exact discovered audio/video track selection by index through `uridecodebin3`.
@@ -54,6 +54,39 @@ cargo run --release -- \
   --bind 127.0.0.1:11471 \
   --cache-dir .cache/air-transcode
 ```
+
+### Embed in Tauri or another Tokio host
+
+The crate owns listener lifecycle as well as the media engine, so a native app
+does not need to shell out to the CLI:
+
+```rust
+let config = air_transcode::Config::loopback(app_cache_dir);
+let server = air_transcode::spawn_server(config).await?;
+let origin = server.origin();
+
+// Inject `origin` into the WebView-side @get-air/transcode client.
+
+server.shutdown().await?;
+```
+
+`Config::loopback` requests an ephemeral loopback port and is the safe default
+for local Tauri playback. For Vizio casting, start the paired host instead:
+
+```rust
+let host = air_transcode::spawn_tauri_host(
+    air_transcode::Config::loopback(app_cache_dir),
+    "0.0.0.0:0".parse()?,
+).await?;
+
+let admin_origin = host.admin_origin();
+let tv_url = host.cast_url(lan_ip, &session.master_url);
+```
+
+The administrative session API remains loopback-only. The LAN listener is
+read-only and mounted beneath a random per-process token, so the TV can fetch
+only manifests and media for session IDs it receives. `host.shutdown()` stops
+both listeners.
 
 Register a source. Credentials belong in headers, not in the TV- or browser-facing HLS URL. The server reads the source on demand and never materializes the complete input as a product feature:
 

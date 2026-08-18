@@ -234,9 +234,15 @@ impl Session {
             .is_some_and(|track| {
                 let codec_compatible = track.web_compatible
                     || kind == TrackKind::Video
-                        && track
-                            .video_codec
-                            .is_some_and(|codec| self.output.video_codecs.contains(&codec));
+                        && track.video_codec.is_some_and(|codec| {
+                            self.output.video_codecs.contains(&codec)
+                                // Real ten-bit Matroska AV1 sources currently hit a
+                                // GstBaseParse timestamp/flush bug during CMAF transmux.
+                                // Decode them through the H.264 fallback until isolated
+                                // worker coverage proves the direct path safe.
+                                && !(codec == VideoCodec::Av1
+                                    && track.bit_depth.unwrap_or(8) > 8)
+                        });
                 let dimensions_compatible = kind != TrackKind::Video
                     || track.width.unwrap_or(0) <= self.output.max_width
                         && track.height.unwrap_or(0) <= self.output.max_height;

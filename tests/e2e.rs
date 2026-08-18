@@ -12,6 +12,7 @@ use std::{
 use air_transcode::{
     AppState, Config, app,
     mp4::{decode_time, media_data, validate_init_segment, validate_media_segment},
+    spawn_server, spawn_tauri_host,
 };
 use axum::{
     Router,
@@ -28,6 +29,49 @@ use tempfile::TempDir;
 use tokio::{net::TcpListener, task::JoinHandle};
 
 type TestResult<T = ()> = Result<T, Box<dyn StdError + Send + Sync>>;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn embedded_server_binds_ephemeral_loopback_and_shuts_down() -> TestResult {
+    let cache = tempfile::tempdir()?;
+    let mut config = Config::loopback(cache.path());
+    config.max_pipelines = 1;
+    let server = spawn_server(config).await?;
+    assert!(server.address().ip().is_loopback());
+    assert_ne!(server.address().port(), 0);
+
+    let response = reqwest::get(format!("{}/health", server.origin())).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.json::<Value>().await?["engine"], "gstreamer");
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tauri_host_keeps_admin_local_and_cast_surface_media_only() -> TestResult {
+    let cache = tempfile::tempdir()?;
+    let host = spawn_tauri_host(Config::loopback(cache.path()), "127.0.0.1:0".parse()?).await?;
+    let client = reqwest::Client::new();
+    let health = host
+        .cast_url("127.0.0.1".parse()?, "/health")
+        .ok_or_else(|| io::Error::other("cast URL is unavailable"))?;
+    assert_eq!(client.get(&health).send().await?.status(), StatusCode::OK);
+    assert_eq!(
+        client
+            .post(health.replace("/health", "/v1/sessions"))
+            .send()
+            .await?
+            .status(),
+        StatusCode::NOT_FOUND,
+    );
+    let wrong_token = health.replacen("/cast/", "/cast/wrong-", 1);
+    assert_eq!(
+        client.get(wrong_token).send().await?.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert!(host.admin_origin().starts_with("http://127.0.0.1:"));
+    host.shutdown().await?;
+    Ok(())
+}
 
 #[derive(Clone)]
 struct OriginState {
