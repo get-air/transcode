@@ -49,7 +49,7 @@ Seven cached Torrentio/Torbox selections were chosen across H.264, HEVC/Dolby Vi
 
 - AAC transmux and Opus, AC-3, E-AC-3, and TrueHD transcoding all emitted AAC-LC 48 kHz stereo CMAF. First-fragment generation measured approximately 0.27–3.47 seconds across six sources, and every output decoded through FFmpeg.
 - H.264 High 1920×1080 and HEVC Main-10 3840×1608 fragments transmuxed, parsed, and decoded successfully. Video and audio random-access requests around 196 seconds returned monotonic timestamps and completed in approximately 1.37–3.82 seconds.
-- A real ten-bit AV1 Matroska source exposed two GStreamer issues absent from generated fixtures: redundant parser timestamp destruction and a native `GstBaseParse` abort on flushing seeks. The safe H.264 fallback produces and decodes segment zero in about 0.62 seconds, but later random access currently returns a controlled media-processing error. Ten-bit AV1 random access remains a release blocker.
+- A real ten-bit AV1 Matroska source exposed two GStreamer issues absent from generated fixtures: redundant parser timestamp destruction and a native `decodebin3`/`GstBaseParse` abort on flushing seeks. Ten-bit AV1 now takes an isolated `uridecodebin` decode path before H.264 encoding. Segment 50 at 196 seconds completed in about 1.27 seconds, began at an exact monotonic `tfdt` of 196 seconds, decoded as H.264 High 1920×1080, and left the server healthy with zero failed pipelines.
 - The run found and fixed a real AAC boundary bug: the collector compared only buffer start timestamps, so a final AAC frame crossing the four-second boundary caused a false timeout after 188 valid buffers. Collection now includes buffer duration and retains the boundary frame.
 
 ## Platform intent

@@ -449,14 +449,24 @@ fn generate_segment_once(
         }
         (TrackKind::Audio, PipelineMode::Transcode, _) => gst::Caps::builder("audio/x-raw").build(),
     };
-    let source = gst::ElementFactory::make("uridecodebin3")
+    let av1_transcode = request.track == TrackKind::Video
+        && matches!(request.mode, PipelineMode::Transcode)
+        && request.transmux_video_codec == Some(VideoCodec::Av1);
+    let source_factory = if av1_transcode {
+        "uridecodebin"
+    } else {
+        "uridecodebin3"
+    };
+    let source = gst::ElementFactory::make(source_factory)
         .name("source")
         .property("uri", request.source.as_str())
         .property("caps", &desired_caps)
         .build()
-        .map_err(|_| Error::MissingElement("uridecodebin3".to_owned()))?;
+        .map_err(|_| Error::MissingElement(source_factory.to_owned()))?;
     configure_source(&source, request.headers.clone(), request.timeout);
-    configure_stream_selection(&source, request.track, request.selected_stream_id.clone());
+    if !av1_transcode {
+        configure_stream_selection(&source, request.track, request.selected_stream_id.clone());
+    }
     let queue = make("queue")?;
     let app_sink = gst::ElementFactory::make("appsink")
         .name("encoded-sink")
@@ -524,13 +534,17 @@ fn generate_segment_once(
         gst::ClockTime::from_nseconds(request.segment.start_ns + request.segment.duration_ns);
     let av1_video =
         request.track == TrackKind::Video && request.transmux_video_codec == Some(VideoCodec::Av1);
-    let flags = match (request.mode, av1_video) {
+    let flags = match (request.mode, av1_video, av1_transcode) {
         // Each segment uses a fresh pipeline, so AV1 does not need a flushing
         // seek. GstBaseParse can abort on a flush seek for real Matroska AV1.
-        (PipelineMode::Transmux, true) => gst::SeekFlags::KEY_UNIT,
-        (PipelineMode::Transcode, true) => gst::SeekFlags::ACCURATE,
-        (PipelineMode::Transmux, false) => gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
-        (PipelineMode::Transcode, false) => gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+        (PipelineMode::Transmux, true, _) => gst::SeekFlags::KEY_UNIT,
+        // The simpler uridecodebin path avoids decodebin3's AV1 multiqueue
+        // assertion and accepts an accurate flushing seek.
+        (PipelineMode::Transcode, true, true) | (PipelineMode::Transcode, false, _) => {
+            gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE
+        }
+        (PipelineMode::Transcode, true, false) => gst::SeekFlags::ACCURATE,
+        (PipelineMode::Transmux, false, _) => gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
     };
     if request.segment.start_ns > 0 {
         let seek_pad = linked_source_pad.lock().clone().ok_or_else(|| {

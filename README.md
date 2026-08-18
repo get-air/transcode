@@ -11,7 +11,7 @@ The server prefers a zero-decode path. H.264/AAC are the conservative defaults; 
 - Complete VOD playlists with a stable duration and `#EXT-X-ENDLIST` from the first request.
 - HLS v7 CMAF output: independent video/audio init segments and `.m4s` media fragments.
 - Direct H.264/AAC transmuxing when profile, chroma format, bit depth, channel count, and requested dimensions are browser-compatible.
-- Opt-in HEVC and validated eight-bit AV1 CMAF transmux for capable clients, including H.265 DTS reconstruction for Matroska sources. Ten-bit Matroska AV1 currently takes the conservative H.264 path because real-source validation exposed a GStreamer parser seek defect.
+- Opt-in HEVC and validated eight-bit AV1 CMAF transmux for capable clients, including H.265 DTS reconstruction for Matroska sources. Ten-bit Matroska AV1 takes the conservative H.264 path through a seek-safe `uridecodebin` pipeline because `decodebin3` can abort on real-source AV1 flush seeks.
 - H.264/AAC transcoding with runtime-ranked hardware encoders and automatic fallback.
 - Default 1080p output ceiling without upscaling smaller sources.
 - Exact discovered audio/video track selection by index through `uridecodebin3`.
