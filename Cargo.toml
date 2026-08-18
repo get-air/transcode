@@ -36,7 +36,7 @@ tempfile = "3.21.0"
 thiserror = "2.0.16"
 tokio = { version = "1.47.1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }
-tower-http = { version = "0.6.6", features = ["catch-panic", "cors", "request-id", "sensitive-headers", "trace"] }
+tower-http = { version = "0.7.0", features = ["catch-panic", "cors", "request-id", "sensitive-headers", "trace"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "json"] }
 url = { version = "2.5.7", features = ["serde"] }
