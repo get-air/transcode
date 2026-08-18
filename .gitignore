@@ -3,5 +3,5 @@
 /coverage/
 /fixtures/generated/
 /test-results/
+/.qualification/
 *.profraw
-
