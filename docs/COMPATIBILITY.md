@@ -72,7 +72,7 @@ Factory discovery is caps-based, so the server does not depend on a hard-coded A
 - Explicit segment job leases so abandoned HTTP requests cancel immediately after a client disconnect.
 - Multiple selectable video/audio/subtitle renditions.
 - Bitmap subtitle support (PGS/VobSub/DVB) through a switchable overlay or OCR path; these are discovered but not advertised as WebVTT.
-- GStreamer Android distribution packaging and on-device MediaCodec tests.
+- Android on-device MediaCodec, lifecycle, thermal, and network-security tests; arm64/API 24 packaging and final ELF linkage are automated.
 - Windows runner playback tests against official MSVC GStreamer binaries (the CI lane is present; a hosted green run remains required).
 - Chromium, Firefox, WebKit, Android WebView, and Safari/hls.js playback automation.
 - Sustained 4K concurrency, memory, cancellation latency, and cache-pressure benchmarks.

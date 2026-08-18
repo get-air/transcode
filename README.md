@@ -10,7 +10,7 @@ The server prefers a zero-decode path. H.264/AAC are the conservative defaults; 
 - GStreamer discovery for duration, seekability, container, codecs, complete caps, bit depth, colorimetry, HDR signals, dimensions, channels, and language.
 - Complete VOD playlists with a stable duration and `#EXT-X-ENDLIST` from the first request.
 - HLS v7 CMAF output: independent video/audio init segments and `.m4s` media fragments.
-- Direct H.264/AAC transmuxing when profile, chroma format, bit depth, channel count, and requested dimensions are browser-compatible.
+- Direct H.264/AAC transmuxing when profile, chroma format, bit depth, channel count, and requested dimensions are browser-compatible, with H.264 decode-timestamp reconstruction for reordered Matroska streams.
 - Per-segment keyframe verification: aligned H.264 stays zero-copy, while a long-GOP seek that lands on an older keyframe automatically retries through exact-keyframe H.264 transcoding within the original deadline.
 - Opt-in HEVC and validated eight-bit AV1 CMAF transmux for capable clients, including H.265 DTS reconstruction for Matroska sources. Ten-bit Matroska AV1 takes the conservative H.264 path through a seek-safe `uridecodebin` pipeline because `decodebin3` can abort on real-source AV1 flush seeks.
 - H.264/AAC transcoding with runtime-ranked hardware encoders and automatic fallback.
@@ -24,7 +24,7 @@ The server prefers a zero-decode path. H.264/AAC are the conservative defaults; 
 - Correct per-segment `tfdt` offsets across independent seek pipelines.
 - Duplicate-request coalescing, bounded concurrency, far-seek cancellation, session TTLs, and bounded per-session caches.
 - Cache corruption detection and regeneration before serving.
-- Linux runtime implementation, a native Windows CI lane against the official MSVC GStreamer SDK, and platform-neutral Rust code paths for Android GStreamer distributions.
+- Linux runtime implementation, a native Windows CI lane against the official MSVC GStreamer SDK, and a reproducible Android arm64/API 24 link against the official `libgstreamer_android.so` aggregate.
 - Metrics for generated, cached, transmuxed, transcoded, failed, cancelled, active, and peak-active work.
 - No production source downloader: local fixture generation and any downloaded samples are test-only.
 
@@ -132,11 +132,11 @@ cargo test --all-targets
 cargo bench --bench manifest
 ```
 
-See [API](docs/API.md), [architecture](docs/ARCHITECTURE.md), [compatibility](docs/COMPATIBILITY.md), and the proposed [`@get-air/video` integration](docs/VIDEO_INTEGRATION.md).
+See [API](docs/API.md), [architecture](docs/ARCHITECTURE.md), [compatibility](docs/COMPATIBILITY.md), [Android/Tauri packaging](docs/ANDROID.md), and the [`@get-air/video` integration](docs/VIDEO_INTEGRATION.md).
 
 ## Status
 
-This repository is under active development. Primary video plus indexed multi-audio and embedded/external text-subtitle renditions are functional and tested. Bitmap subtitles, exact arbitrary-keyframe handling for opt-in HEVC/AV1 passthrough, Android packaging, and browser-matrix automation remain release gates rather than silently claimed support.
+This repository is under active development. Primary video plus indexed multi-audio and embedded/external text-subtitle renditions are functional and tested. Bitmap subtitles, exact arbitrary-keyframe handling for opt-in HEVC/AV1 passthrough, Android on-device qualification, and browser-matrix automation remain release gates rather than silently claimed support.
 
 ## License
 

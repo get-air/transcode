@@ -33,7 +33,7 @@ segment request
 
 ## Media decisions
 
-H.264 video is transmuxable by default only when it is baseline, constrained-baseline, main, or high profile; 4:2:0; eight-bit; and within the requested dimensions. A client may also declare HEVC or AV1 decoding support; a matching track within the requested dimensions is then parsed and transmuxed without decoding. H.265 passes through `h265timestamper` so Matroska presentation timestamps become valid CMAF decode timestamps. Audio is transmuxable only when it is MPEG-4 AAC with no more than two channels. Otherwise the track is transcoded.
+H.264 video is transmuxable by default only when it is baseline, constrained-baseline, main, or high profile; 4:2:0; eight-bit; and within the requested dimensions. A client may also declare HEVC or AV1 decoding support; a matching track within the requested dimensions is then parsed and transmuxed without decoding. H.264 and H.265 pass through their codec timestamp reconstructors so reordered Matroska presentation timestamps become valid CMAF decode timestamps. Audio is transmuxable only when it is MPEG-4 AAC with no more than two channels. Otherwise the track is transcoded.
 
 The inspected Stremio server bundle defaults its HLS transmux surface to H.264/AAC. Its H.264 transcode path labels/converts output as BT.709 but does not include a real tone-mapping stage. Air does not treat that metadata rewrite as HDR conversion: HEVC/AV1 passthrough preserves HDR for capable targets. When the active VA driver exposes GStreamer's `hdr-tone-mapping` property and a VA H.264 encoder, Air reports `hdr_tone_mapping: "va"` and keeps the HDR-to-SDR path in hardware. Other runtimes report `"unavailable"` and reject the conversion.
 

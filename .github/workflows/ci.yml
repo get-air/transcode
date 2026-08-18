@@ -23,7 +23,7 @@ jobs:
           gst-plugins-ugly gst-libav
           gst-plugin-isobmff
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.1 --profile minimal --component rustfmt,clippy
@@ -53,7 +53,7 @@ jobs:
       GSTREAMER_VERSION: 1.28.6
       GSTREAMER_ROOT: C:\gstreamer
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install official GStreamer SDK
         shell: pwsh
@@ -81,7 +81,7 @@ jobs:
         shell: pwsh
         run: |
           gst-inspect-1.0 --version
-          @("cmafmux", "x264enc", "avdec_h264", "avenc_aac") | ForEach-Object {
+          @("cmafmux", "h264timestamper", "x264enc", "avdec_h264", "avenc_aac") | ForEach-Object {
             gst-inspect-1.0 $_ | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "Missing GStreamer element: $_" }
           }
@@ -97,3 +97,60 @@ jobs:
 
       - name: Build release binary and library
         run: cargo build --release --all-targets --locked
+
+  android-arm64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GSTREAMER_VERSION: 1.28.6
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.96.1 --profile minimal
+          rustup target add aarch64-linux-android --toolchain 1.96.1
+
+      - name: Resolve Android NDK
+        run: |
+          ndk_root="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          test -x "$ndk_root/ndk-build"
+          echo "AIR_NDK_ROOT=$ndk_root" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: .ci/downloads/gstreamer-android-${{ env.GSTREAMER_VERSION }}.tar.xz
+          key: gstreamer-android-${{ env.GSTREAMER_VERSION }}
+
+      - name: Download official GStreamer Android SDK
+        run: |
+          mkdir -p .ci/downloads
+          archive=".ci/downloads/gstreamer-android-$GSTREAMER_VERSION.tar.xz"
+          if [[ ! -f "$archive" ]]; then
+            curl --fail --location --retry 3 \
+              --output "$archive" \
+              "https://gstreamer.freedesktop.org/data/pkg/android/$GSTREAMER_VERSION/gstreamer-1.0-android-universal-$GSTREAMER_VERSION.tar.xz"
+          fi
+
+      - name: Extract arm64 SDK
+        run: |
+          mkdir -p .ci/gstreamer-android
+          if [[ ! -f .ci/gstreamer-android/arm64/lib/pkgconfig/gstreamer-1.0.pc ]]; then
+            tar -xJf ".ci/downloads/gstreamer-android-$GSTREAMER_VERSION.tar.xz" \
+              -C .ci/gstreamer-android arm64
+          fi
+
+      - name: Build and link Android runtime
+        env:
+          ANDROID_NDK_HOME: ${{ env.AIR_NDK_ROOT }}
+          GSTREAMER_ROOT_ANDROID: ${{ github.workspace }}/.ci/gstreamer-android
+        run: ./scripts/build-android.sh
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: air-transcode-android-arm64
+          retention-days: 7
+          path: |
+            target/android-rust/aarch64-linux-android/release/air-transcode
+            target/android-gstreamer/arm64-v8a/libs/arm64-v8a/libgstreamer_android.so
+            target/android-gstreamer/arm64-v8a/libs/arm64-v8a/libc++_shared.so

@@ -958,7 +958,7 @@ fn build_video_transmux_chain(codec: VideoCodec) -> Result<Vec<gst::Element>> {
                 .field("stream-format", "avc")
                 .field("alignment", "au")
                 .build();
-            (parser, caps, None)
+            (parser, caps, Some(make("h264timestamper")?))
         }
         VideoCodec::H265 => {
             let parser = make("h265parse")?;

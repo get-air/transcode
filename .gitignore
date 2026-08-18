@@ -4,4 +4,5 @@
 /fixtures/generated/
 /test-results/
 /.qualification/
+/.ci/
 *.profraw

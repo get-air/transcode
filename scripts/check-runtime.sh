@@ -5,6 +5,7 @@ required=(
   uridecodebin3
   souphttpsrc
   h264parse
+  h264timestamper
   aacparse
   cmafmux
 )
