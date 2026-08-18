@@ -31,6 +31,8 @@ use crate::{
 pub struct CreateSession {
     pub source: Source,
     #[serde(default)]
+    pub relay_only: bool,
+    #[serde(default)]
     pub output: OutputOptions,
     #[serde(default)]
     pub subtitles: Vec<ExternalSubtitle>,
@@ -152,6 +154,10 @@ struct ActiveRequest {
 }
 
 impl Session {
+    pub const fn source(&self) -> &Source {
+        &self.source
+    }
+
     #[must_use]
     pub fn view(&self) -> SessionView {
         let renditions = self
@@ -492,8 +498,10 @@ impl SessionManager {
             });
             external_subtitles.insert(index, subtitle);
         }
-        validate_track_selection(&media, &request.output)?;
-        validate_hdr_output(&media, &request.output, self.hdr_tone_mapping)?;
+        if !request.relay_only {
+            validate_track_selection(&media, &request.output)?;
+            validate_hdr_output(&media, &request.output, self.hdr_tone_mapping)?;
+        }
         let id = Uuid::new_v4();
         let directory = self.config.cache_dir.join(id.to_string());
         std::fs::create_dir_all(&directory)?;

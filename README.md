@@ -7,6 +7,8 @@ The server prefers a zero-decode path. H.264/AAC are the conservative defaults; 
 ## Current features
 
 - Authenticated remote HTTP sources with caller-provided headers kept in memory.
+- A tokenized, range-preserving source relay for browser demuxers such as
+  MediaBunny when the upstream media origin does not grant CORS access.
 - GStreamer discovery for duration, seekability, container, codecs, complete caps, bit depth, colorimetry, HDR signals, dimensions, channels, and language.
 - Complete VOD playlists with a stable duration and `#EXT-X-ENDLIST` from the first request.
 - HLS v7 CMAF output: independent video/audio init segments and `.m4s` media fragments.

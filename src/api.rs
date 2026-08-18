@@ -3,8 +3,8 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, State},
-    http::{HeaderValue, StatusCode, header},
+    extract::{Path, Request, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -82,6 +82,7 @@ pub fn media_app(state: AppState) -> Router {
 fn media_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/v1/sessions/{id}/master.m3u8", get(master))
+        .route("/v1/sessions/{id}/source", get(source_relay))
         .route("/v1/sessions/{id}/video.m3u8", get(video_media))
         .route("/v1/sessions/{id}/audio.m3u8", get(audio_media))
         .route(
@@ -115,7 +116,57 @@ fn api_cors() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([http::Method::GET, http::Method::POST, http::Method::DELETE])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::RANGE])
+        .expose_headers([
+            header::ACCEPT_RANGES,
+            header::CONTENT_LENGTH,
+            header::CONTENT_RANGE,
+            header::CONTENT_TYPE,
+        ])
+}
+
+async fn source_relay(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    request: Request,
+) -> Result<Response> {
+    let session = state.sessions.get(id)?;
+    let source = session.source();
+    if !matches!(source.url.scheme(), "http" | "https") {
+        return Err(Error::InvalidSource(
+            "browser source relay supports HTTP and HTTPS only".to_owned(),
+        ));
+    }
+    let client = reqwest::Client::new();
+    let mut upstream = client.request(request.method().clone(), source.url.clone());
+    for (name, value) in &source.headers {
+        upstream = upstream.header(name, value);
+    }
+    if let Some(range) = request.headers().get(header::RANGE) {
+        upstream = upstream.header(header::RANGE, range);
+    }
+    let upstream = upstream
+        .send()
+        .await
+        .map_err(|error| Error::Pipeline(format!("source relay failed: {error}")))?;
+    let status = upstream.status();
+    let mut headers = HeaderMap::new();
+    for name in [
+        header::ACCEPT_RANGES,
+        header::CONTENT_LENGTH,
+        header::CONTENT_RANGE,
+        header::CONTENT_TYPE,
+        header::ETAG,
+        header::LAST_MODIFIED,
+    ] {
+        if let Some(value) = upstream.headers().get(&name) {
+            headers.insert(name, value.clone());
+        }
+    }
+    let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    Ok(response)
 }
 
 #[derive(Serialize)]
