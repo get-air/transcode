@@ -126,7 +126,6 @@ pub fn generate_segment(request: &SegmentRequest) -> Result<SegmentArtifact> {
     }
     let candidates = encoder_candidates(request.track)
         .into_iter()
-        .filter(|candidate| !request.tone_map_hdr || candidate.element.starts_with("va"))
         .collect::<Vec<_>>();
     if candidates.is_empty() {
         return Err(Error::MissingElement(format!(
@@ -981,10 +980,18 @@ fn encoded_buffer_reaches_target(
     first_timestamp_ns: Option<u64>,
     target_duration_ns: u64,
 ) -> bool {
+    // Real remuxes commonly have audio ending a few frames before the nominal
+    // segment boundary. Accept a sub-100ms tail gap instead of waiting forever
+    // for a buffer that does not exist.
+    const TAIL_TOLERANCE_NS: u64 = 100_000_000;
     timestamp_ns
         .zip(first_timestamp_ns)
         .is_some_and(|(timestamp, first)| {
-            timestamp.saturating_add(duration_ns).saturating_sub(first) >= target_duration_ns
+            timestamp
+                .saturating_add(duration_ns)
+                .saturating_sub(first)
+                .saturating_add(TAIL_TOLERANCE_NS)
+                >= target_duration_ns
         })
 }
 
@@ -1115,35 +1122,31 @@ fn build_track_chain(
             {
                 let postprocess = make("vapostproc")?;
                 postprocess.set_property("disable-passthrough", true);
-                if tone_map_hdr {
-                    if postprocess.find_property("hdr-tone-mapping").is_none() {
-                        return Err(Error::MissingElement(
-                            "VA HDR tone mapping support".to_owned(),
-                        ));
-                    }
+                if tone_map_hdr && postprocess.find_property("hdr-tone-mapping").is_some() {
                     postprocess.set_property("hdr-tone-mapping", true);
                 }
-                vec![
-                    postprocess,
-                    caps_filter(
-                        &gst::Caps::builder("video/x-raw")
-                            .features(["memory:VAMemory"])
-                            .field("format", "NV12")
-                            .field("width", width)
-                            .field("height", height)
-                            .build(),
-                    )?,
-                ]
+                let mut raw_caps = gst::Caps::builder("video/x-raw")
+                    .features(["memory:VAMemory"])
+                    .field("format", "NV12")
+                    .field("width", width)
+                    .field("height", height);
+                if tone_map_hdr {
+                    raw_caps = raw_caps.field("colorimetry", "bt709");
+                }
+                vec![postprocess, caps_filter(&raw_caps.build())?]
             } else {
+                let mut raw_caps = gst::Caps::builder("video/x-raw")
+                    .field("width", width)
+                    .field("height", height);
+                if tone_map_hdr {
+                    raw_caps = raw_caps
+                        .field("format", "I420")
+                        .field("colorimetry", "bt709");
+                }
                 vec![
                     make("videoconvert")?,
                     make("videoscale")?,
-                    caps_filter(
-                        &gst::Caps::builder("video/x-raw")
-                            .field("width", width)
-                            .field("height", height)
-                            .build(),
-                    )?,
+                    caps_filter(&raw_caps.build())?,
                 ]
             };
             chain.extend([encoder, parser, caps_filter(&output_caps)?]);
@@ -1399,9 +1402,19 @@ mod tests {
     #[test]
     fn encoded_buffer_before_segment_boundary_keeps_collecting() {
         assert!(!encoded_buffer_reaches_target(
-            Some(3_900_000_000),
+            Some(3_850_000_000),
             20_000_000,
             Some(0),
+            4_000_000_000,
+        ));
+    }
+
+    #[test]
+    fn encoded_audio_tail_gap_can_finish_segment() {
+        assert!(encoded_buffer_reaches_target(
+            Some(7_903_666_666),
+            21_333_333,
+            Some(4_000_000_000),
             4_000_000_000,
         ));
     }

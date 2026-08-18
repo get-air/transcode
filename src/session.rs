@@ -628,7 +628,10 @@ impl SessionManager {
         }
         let mode = session.mode_for(track, track_index);
         if track == TrackKind::Audio && matches!(mode, PipelineMode::Transcode) {
-            return self.audio_bundle_for(session, track_index, sequence).await;
+            let all_tracks = !session.output.video_enabled;
+            return self
+                .audio_bundle_for(session, track_index, sequence, all_tracks)
+                .await;
         }
         let segment = session
             .segments
@@ -662,7 +665,7 @@ impl SessionManager {
         let tone_map_hdr = track == TrackKind::Video
             && matches!(mode, PipelineMode::Transcode)
             && selected_track.hdr_format.is_some()
-            && self.hdr_tone_mapping == HdrToneMapping::Va;
+            && self.hdr_tone_mapping != HdrToneMapping::Unavailable;
         let (resolved_url, resolved_headers) = session.source.resolved();
         let request = SegmentRequest {
             source: resolved_url,
@@ -763,6 +766,7 @@ impl SessionManager {
         session: Arc<Session>,
         track_index: usize,
         sequence: u32,
+        all_tracks: bool,
     ) -> Result<SegmentArtifact> {
         let segment = session
             .segments
@@ -804,6 +808,7 @@ impl SessionManager {
         }
         let tracks = session
             .tracks("audio")
+            .filter(|track| all_tracks || track.index == track_index)
             .map(|track| AudioBundleTrack {
                 index: track.index,
                 stream_id: track.stream_id.clone(),
@@ -820,7 +825,7 @@ impl SessionManager {
             headers,
             tracks,
             segment,
-            timeout: Duration::from_secs(3),
+            timeout: Duration::from_secs(if all_tracks { 3 } else { 6 }),
             cancellation: cancellation.clone(),
         };
         let queue_started = Instant::now();
@@ -905,7 +910,7 @@ impl SessionManager {
             .map(|track| track.index)
             .ok_or_else(|| Error::TrackNotFound("audio".to_owned()))?;
         let _ = self
-            .audio_bundle_for(session, track_index, sequence)
+            .audio_bundle_for(session, track_index, sequence, true)
             .await?;
         Ok(sequence)
     }
@@ -1279,6 +1284,7 @@ mod tests {
         assert!(validate_hdr_output(&media, &output, HdrToneMapping::Unavailable).is_ok());
         output.max_width = 1920;
         assert!(validate_hdr_output(&media, &output, HdrToneMapping::Unavailable).is_err());
+        assert!(validate_hdr_output(&media, &output, HdrToneMapping::Basic).is_ok());
         assert!(validate_hdr_output(&media, &output, HdrToneMapping::Va).is_ok());
     }
 }

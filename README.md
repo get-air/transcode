@@ -140,7 +140,7 @@ curl http://127.0.0.1:11471/v1/sessions \
   }'
 ```
 
-Play the returned `master_url` with an HLS/MSE player such as hls.js. Its audio and subtitle track lists map directly to the HLS rendition groups, so changing `audioTrack` or `subtitleTrack` does not recreate the server session. Only add `"h265"` or `"av1"` to `video_codecs` after checking the actual browser/device decoder. For HDR, passthrough preserves the encoded signal. Machines whose VA driver exposes GStreamer's `hdr-tone-mapping` property report `hdr_tone_mapping: "va"` and can produce SDR through the hardware path; other machines report `"unavailable"` and reject fake eight-bit conversion.
+Play the returned `master_url` with an HLS/MSE player such as hls.js. Its audio and subtitle track lists map directly to the HLS rendition groups, so changing `audioTrack` or `subtitleTrack` does not recreate the server session. Only add `"h265"` or `"av1"` to `video_codecs` after checking the actual browser/device decoder. HDR passthrough preserves the encoded signal. Machines whose VA driver exposes GStreamer's `hdr-tone-mapping` property report `hdr_tone_mapping: "va"`; other complete GStreamer installations report `"basic"` and convert HDR/10-bit input to browser-safe BT.709 H.264 as a compatibility fallback. Hardware decode, scaling, and encode remain preferred (VA on Linux and platform hardware codecs elsewhere); software is the final fallback. Full-transcode sessions generate only the requested AAC track, while Hybrid warming still prepares every alternate track.
 
 ## Test
 

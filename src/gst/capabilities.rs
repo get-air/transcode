@@ -31,6 +31,7 @@ pub struct Capabilities {
 #[serde(rename_all = "snake_case")]
 pub enum HdrToneMapping {
     Va,
+    Basic,
     Unavailable,
 }
 
@@ -49,6 +50,11 @@ pub fn hdr_tone_mapping() -> HdrToneMapping {
         .is_some_and(|element| element.find_property("hdr-tone-mapping").is_some());
     if va_encoder && va_postprocess {
         HdrToneMapping::Va
+    } else if available("videoconvert")
+        && available("videoscale")
+        && !encoder_candidates(TrackKind::Video).is_empty()
+    {
+        HdrToneMapping::Basic
     } else {
         HdrToneMapping::Unavailable
     }
