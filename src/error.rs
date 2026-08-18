@@ -40,6 +40,15 @@ pub enum Error {
     #[error("GStreamer pipeline failed: {0}")]
     Pipeline(String),
 
+    #[error(
+        "direct video transmux cannot start segment {sequence} at a keyframe near {requested_ns} ns (first buffer {actual_ns} ns)"
+    )]
+    MisalignedKeyframe {
+        sequence: u32,
+        requested_ns: u64,
+        actual_ns: u64,
+    },
+
     #[error("I/O failed: {0}")]
     Io(#[from] std::io::Error),
 
@@ -73,7 +82,7 @@ impl IntoResponse for Error {
                 (StatusCode::NOT_FOUND, "not_found")
             }
             Self::MissingElement(_) => (StatusCode::SERVICE_UNAVAILABLE, "missing_runtime"),
-            Self::Discovery(_) | Self::Pipeline(_) => {
+            Self::Discovery(_) | Self::Pipeline(_) | Self::MisalignedKeyframe { .. } => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "media_processing_failed")
             }
             Self::GStreamerInitialization(_) | Self::Io(_) | Self::Task(_) => {

@@ -46,6 +46,7 @@ pub struct SegmentRequest {
     pub video_dimensions: Option<(u32, u32)>,
     pub selected_stream_id: Option<String>,
     pub transmux_video_codec: Option<VideoCodec>,
+    pub tone_map_hdr: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -81,13 +82,35 @@ pub struct SubtitleArtifact {
 /// Returns an error for unavailable plugins, failed source seeks, pipeline
 /// failures, timeouts, malformed generated CMAF, or cache I/O failures.
 pub fn generate_segment(request: &SegmentRequest) -> Result<SegmentArtifact> {
+    let started = std::time::Instant::now();
     if request.cancellation.is_cancelled() {
         return Err(Error::Cancelled);
     }
     if !matches!(request.mode, PipelineMode::Transcode) {
-        return generate_segment_once(request, None);
+        return match generate_segment_once(request, None) {
+            Ok(artifact) => Ok(artifact),
+            Err(Error::MisalignedKeyframe { .. })
+                if request.track == TrackKind::Video
+                    && request.transmux_video_codec == Some(VideoCodec::H264) =>
+            {
+                cleanup_attempt_files(&request.output_dir)?;
+                let mut fallback = request.clone();
+                fallback.mode = PipelineMode::Transcode;
+                fallback.timeout = request.timeout.saturating_sub(started.elapsed());
+                if fallback.timeout.is_zero() {
+                    return Err(Error::Pipeline(
+                        "transmux keyframe check exhausted the segment deadline".to_owned(),
+                    ));
+                }
+                generate_segment(&fallback)
+            }
+            Err(error) => Err(error),
+        };
     }
-    let candidates = encoder_candidates(request.track);
+    let candidates = encoder_candidates(request.track)
+        .into_iter()
+        .filter(|candidate| !request.tone_map_hdr || candidate.element.starts_with("va"))
+        .collect::<Vec<_>>();
     if candidates.is_empty() {
         return Err(Error::MissingElement(format!(
             "{} encoder producing browser-compatible output",
@@ -487,6 +510,7 @@ fn generate_segment_once(
         encoder_name,
         request.video_dimensions,
         request.transmux_video_codec,
+        request.tone_map_hdr,
     )?;
     for element in &chain {
         pipeline
@@ -588,6 +612,7 @@ fn generate_segment_once(
     );
     let _ = pipeline.set_state(gst::State::Null);
     let encoded = encoded?;
+    validate_transmux_keyframe(request, &encoded)?;
 
     mux_encoded_track(request, encoded, &combined_path)?;
 
@@ -604,6 +629,45 @@ fn generate_segment_once(
         mode: request.mode,
         cached: false,
     })
+}
+
+fn validate_transmux_keyframe(request: &SegmentRequest, encoded: &EncodedTrack) -> Result<()> {
+    if request.track != TrackKind::Video
+        || !matches!(request.mode, PipelineMode::Transmux)
+        || request.segment.start_ns == 0
+    {
+        return Ok(());
+    }
+    let first = encoded
+        .buffers
+        .first()
+        .ok_or_else(|| Error::Pipeline("pipeline produced no video buffer".to_owned()))?;
+    let actual_ns = encoded_timestamp_ns(first).ok_or_else(|| {
+        Error::Pipeline("first transmuxed video buffer has no timestamp".to_owned())
+    })?;
+    let tolerance_ns = first
+        .duration()
+        .map_or(100_000_000, gst::ClockTime::nseconds)
+        .max(100_000_000);
+    if first.flags().contains(gst::BufferFlags::DELTA_UNIT)
+        || actual_ns.abs_diff(request.segment.start_ns) > tolerance_ns
+    {
+        return Err(Error::MisalignedKeyframe {
+            sequence: request.segment.sequence,
+            requested_ns: request.segment.start_ns,
+            actual_ns,
+        });
+    }
+    Ok(())
+}
+
+fn encoded_timestamp_ns(buffer: &gst::Buffer) -> Option<u64> {
+    match (buffer.dts(), buffer.pts()) {
+        (Some(dts), Some(pts)) => Some(dts.max(pts).nseconds()),
+        (Some(dts), None) => Some(dts.nseconds()),
+        (None, Some(pts)) => Some(pts.nseconds()),
+        (None, None) => None,
+    }
 }
 
 struct EncodedTrack {
@@ -642,12 +706,7 @@ fn collect_encoded_track(
                 caps = sample.caps_owned();
             }
             if let Some(buffer) = sample.buffer_owned() {
-                let timestamp_ns = match (buffer.dts(), buffer.pts()) {
-                    (Some(dts), Some(pts)) => Some(dts.max(pts).nseconds()),
-                    (Some(dts), None) => Some(dts.nseconds()),
-                    (None, Some(pts)) => Some(pts.nseconds()),
-                    (None, None) => None,
-                };
+                let timestamp_ns = encoded_timestamp_ns(&buffer);
                 if first_timestamp_ns.is_none() {
                     first_timestamp_ns = timestamp_ns;
                 }
@@ -795,6 +854,7 @@ fn build_track_chain(
     encoder_name: Option<&str>,
     video_dimensions: Option<(u32, u32)>,
     transmux_video_codec: Option<VideoCodec>,
+    tone_map_hdr: bool,
 ) -> Result<Vec<gst::Element>> {
     match (track, mode) {
         (TrackKind::Video, PipelineMode::Transmux) => {
@@ -830,6 +890,14 @@ fn build_track_chain(
             {
                 let postprocess = make("vapostproc")?;
                 postprocess.set_property("disable-passthrough", true);
+                if tone_map_hdr {
+                    if postprocess.find_property("hdr-tone-mapping").is_none() {
+                        return Err(Error::MissingElement(
+                            "VA HDR tone mapping support".to_owned(),
+                        ));
+                    }
+                    postprocess.set_property("hdr-tone-mapping", true);
+                }
                 vec![
                     postprocess,
                     caps_filter(

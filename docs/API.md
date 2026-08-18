@@ -17,7 +17,7 @@ Reports process health and the selected media engine.
 
 ## `GET /v1/capabilities`
 
-Reports the GStreamer version, required HTTP/CMAF plugins, and every installed H.264/AAC encoder whose source caps can produce the web output contract. Encoder order is the actual attempt order.
+Reports the GStreamer version, required HTTP/CMAF plugins, every installed H.264/AAC encoder whose source caps can produce the web output contract, and `hdr_tone_mapping` as `va` or `unavailable`. Encoder order is the actual attempt order.
 
 ## `GET /v1/metrics`
 
@@ -63,7 +63,7 @@ Input constraints:
 - Output dimensions: both at least two pixels.
 - Selected video, audio, and subtitle indexes must identify a discovered track of the corresponding kind. Audio and subtitle indexes choose defaults; every playable audio/text-subtitle track remains available for runtime HLS switching.
 - `video_codecs` is the target's declared decode surface. It defaults to `["h264"]`; accepted values are `h264`, `h265`, and `av1`. A matching source is transmuxed only when it also fits the requested dimensions. Ten-bit Matroska AV1 is currently forced through the H.264 fallback after real-source validation exposed unsafe GStreamer parser behavior during random-access transmux.
-- `hdr_formats` is the target's case-insensitive HDR render surface, for example `["hdr10"]`. HDR is passed through only when the source codec, dimensions, and HDR format are all declared. Because this build has no color-correct tone mapper, an HDR source that would otherwise be transcoded is rejected instead of silently producing incorrect eight-bit color.
+- `hdr_formats` is the target's case-insensitive HDR render surface, for example `["hdr10"]`. HDR is passed through only when the source codec, dimensions, and HDR format are all declared. An HDR source that must become SDR uses VA hardware tone mapping only when the runtime reports it; otherwise the request is rejected instead of silently producing incorrect eight-bit color.
 - A finite duration is required. Unknown-duration streams are rejected as non-VOD.
 - Up to 64 external text subtitles may be attached. Each uses the same validated source/header contract, a 1–256 character display name, optional language, and signed millisecond timing offset.
 

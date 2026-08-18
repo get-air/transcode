@@ -8,10 +8,11 @@
 - Multiple named/language-tagged audio renditions with independent caches.
 - Multiple text-subtitle renditions normalized to segmented WebVTT.
 - H.264 AVC in `avc`/access-unit alignment by default.
+- H.264 segment starts are verified against the requested keyframe boundary; misaligned long-GOP segments retry through H.264 transcode instead of duplicating old frames.
 - Opt-in HEVC `hvc1` and validated eight-bit AV1 OBU-stream CMAF passthrough for targets that declare those decoders.
 - AAC-LC raw access units, stereo at most.
 - Explicit RFC 6381 `CODECS` declarations for both direct and transcoded renditions.
-- Explicit target HDR declarations. Unsupported HDR conversion is rejected while tone mapping is unavailable; it is never mislabeled as valid SDR.
+- Explicit target HDR declarations. VA-driver tone mapping is used only when the runtime exposes it; unsupported HDR conversion is rejected and never mislabeled as valid SDR.
 - Complete finite VOD duration and `ENDLIST`.
 - A keyframe at every video fragment boundary.
 - Monotonic `tfdt` across independently generated fragments.
@@ -23,6 +24,7 @@
 - VP9/Opus Matroska transcode.
 - HEVC/AAC and AV1/AAC Matroska video transmux without reencoding.
 - Ten-bit 4:4:4 H.264 incompatibility classification.
+- Ten-second-GOP H.264 seek misalignment detection and exact-keyframe transcode fallback.
 - Random access by requesting segment two before segment one.
 - Eight concurrent identical requests with one generation.
 - Exact selection between two AAC tracks with different encoded payloads.
@@ -65,12 +67,12 @@ Factory discovery is caps-based, so the server does not depend on a hard-coded A
 
 ## Gates before a stable release
 
-- Exact MP4 and Matroska keyframe maps for arbitrary-GOP direct transmuxing.
-- Color-correct Dolby Vision/HDR10/HDR10+ to SDR tone mapping. Eight-bit conversion without tone mapping is not considered visually correct.
+- Exact MP4 and Matroska keyframe handling for opt-in HEVC/AV1 passthrough. Default H.264 already falls back safely per segment.
+- Cross-vendor color-correct Dolby Vision/HDR10/HDR10+ to SDR tone mapping. VA-driver tone mapping is supported when advertised; eight-bit conversion without a real tone mapper is not considered visually correct.
 - Explicit segment job leases so abandoned HTTP requests cancel immediately after a client disconnect.
 - Multiple selectable video/audio/subtitle renditions.
 - Bitmap subtitle support (PGS/VobSub/DVB) through a switchable overlay or OCR path; these are discovered but not advertised as WebVTT.
 - GStreamer Android distribution packaging and on-device MediaCodec tests.
-- Windows runner tests against official MSVC GStreamer binaries.
+- Windows runner playback tests against official MSVC GStreamer binaries (the CI lane is present; a hosted green run remains required).
 - Chromium, Firefox, WebKit, Android WebView, and Safari/hls.js playback automation.
 - Sustained 4K concurrency, memory, cancellation latency, and cache-pressure benchmarks.

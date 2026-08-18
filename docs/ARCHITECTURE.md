@@ -35,7 +35,7 @@ segment request
 
 H.264 video is transmuxable by default only when it is baseline, constrained-baseline, main, or high profile; 4:2:0; eight-bit; and within the requested dimensions. A client may also declare HEVC or AV1 decoding support; a matching track within the requested dimensions is then parsed and transmuxed without decoding. H.265 passes through `h265timestamper` so Matroska presentation timestamps become valid CMAF decode timestamps. Audio is transmuxable only when it is MPEG-4 AAC with no more than two channels. Otherwise the track is transcoded.
 
-The inspected Stremio server bundle defaults its HLS transmux surface to H.264/AAC. Its H.264 transcode path labels/converts output as BT.709 but does not include a real tone-mapping stage. Air does not treat that metadata rewrite as HDR conversion: HEVC/AV1 passthrough preserves HDR for capable targets, while color-correct HDR-to-SDR remains an explicit release gate and `GET /v1/capabilities` reports `hdr_tone_mapping: "unavailable"`.
+The inspected Stremio server bundle defaults its HLS transmux surface to H.264/AAC. Its H.264 transcode path labels/converts output as BT.709 but does not include a real tone-mapping stage. Air does not treat that metadata rewrite as HDR conversion: HEVC/AV1 passthrough preserves HDR for capable targets. When the active VA driver exposes GStreamer's `hdr-tone-mapping` property and a VA H.264 encoder, Air reports `hdr_tone_mapping: "va"` and keeps the HDR-to-SDR path in hardware. Other runtimes report `"unavailable"` and reject the conversion.
 
 Encoder selection is registry-driven rather than operating-system-name-driven. Factories are filtered by output caps, hardware implementations sort first, and each candidate is attempted until one qualifies under the real pipeline. This also finds Android MediaCodec factories whose names are device-specific.
 
@@ -57,6 +57,6 @@ One adjacent segment is scheduled after a short delay only when a permit is idle
 
 Each segment has a private generation directory. Cached artifacts are parsed before reuse. Truncated or malformed artifacts are deleted and regenerated. Session count, TTL, pipeline count, and cached segment count are independently bounded.
 
-## Known hard problem: arbitrary-keyframe transmux maps
+## Arbitrary-keyframe transmux handling
 
-Independent range-seek transmuxing must use real source keyframe boundaries. A fixed four-second timeline is exact only when keyframes align with those boundaries. The release design requires a GStreamer-backed byte-range reader plus MP4/Matroska index extraction, or an equivalent GStreamer index API, before arbitrary-keyframe sources can be advertised as exact direct transmux. Until then this is a documented release gate and is covered by adversarial fixture work rather than hidden behind optimistic metadata.
+Independent range-seek transmuxing must use real source keyframe boundaries. Every nonzero video segment now checks the first encoded keyframe timestamp before normalization. Default H.264 retries a misaligned segment through exact-keyframe H.264 transcoding, so seeking remains correct without scanning a whole remote file up front. Opt-in HEVC/AV1 passthrough still requires aligned source keyframes; a future source index map or same-codec encoder fallback is required to make arbitrary GOPs transparent for those formats.

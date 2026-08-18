@@ -20,8 +20,9 @@ use crate::{
     config::Config,
     error::{Error, Result},
     gst::{
-        MediaInfo, PipelineMode, ProbeRequest, SegmentArtifact, SegmentRequest, SubtitleArtifact,
-        SubtitleRequest, VideoCodec, generate_segment, generate_subtitle_segment, probe,
+        HdrToneMapping, MediaInfo, PipelineMode, ProbeRequest, SegmentArtifact, SegmentRequest,
+        SubtitleArtifact, SubtitleRequest, VideoCodec, generate_segment, generate_subtitle_segment,
+        hdr_tone_mapping, probe,
     },
     hls::{SegmentSpec, TrackKind, segment_map},
 };
@@ -346,6 +347,7 @@ pub struct SessionManager {
     sessions: Arc<DashMap<Uuid, Arc<Session>>>,
     pipelines: Arc<Semaphore>,
     metrics: Arc<Metrics>,
+    hdr_tone_mapping: HdrToneMapping,
 }
 
 #[derive(Default)]
@@ -418,6 +420,7 @@ impl SessionManager {
             config,
             metrics: Arc::new(Metrics::default()),
             sessions: Arc::new(DashMap::new()),
+            hdr_tone_mapping: hdr_tone_mapping(),
         })
     }
 
@@ -490,7 +493,7 @@ impl SessionManager {
             external_subtitles.insert(index, subtitle);
         }
         validate_track_selection(&media, &request.output)?;
-        validate_hdr_output(&media, &request.output)?;
+        validate_hdr_output(&media, &request.output, self.hdr_tone_mapping)?;
         let id = Uuid::new_v4();
         let directory = self.config.cache_dir.join(id.to_string());
         std::fs::create_dir_all(&directory)?;
@@ -620,6 +623,10 @@ impl SessionManager {
             drop(active);
         }
         let mode = session.mode_for(track, track_index);
+        let tone_map_hdr = track == TrackKind::Video
+            && matches!(mode, PipelineMode::Transcode)
+            && selected_track.hdr_format.is_some()
+            && self.hdr_tone_mapping == HdrToneMapping::Va;
         let request = SegmentRequest {
             source: session.source.url.clone(),
             headers: session.source.headers.clone(),
@@ -636,6 +643,7 @@ impl SessionManager {
             video_dimensions: session.video_output_dimensions(),
             selected_stream_id: selected_track.stream_id.clone(),
             transmux_video_codec: selected_track.video_codec,
+            tone_map_hdr,
         };
         let cancel_on_drop = cancellation.drop_guard();
         let permit = Arc::clone(&self.pipelines)
@@ -974,7 +982,11 @@ fn track_is_compatible(
     codec_compatible && dimensions_compatible && hdr_compatible
 }
 
-fn validate_hdr_output(media: &MediaInfo, output: &OutputOptions) -> Result<()> {
+fn validate_hdr_output(
+    media: &MediaInfo,
+    output: &OutputOptions,
+    tone_mapping: HdrToneMapping,
+) -> Result<()> {
     let video = media.tracks.iter().find(|track| {
         track.kind == "video"
             && output
@@ -989,7 +1001,7 @@ fn validate_hdr_output(media: &MediaInfo, output: &OutputOptions) -> Result<()> 
     let requires_transcode = output.force_transcode
         || !output.transmux
         || !track_is_compatible(video, TrackKind::Video, output);
-    if requires_transcode {
+    if requires_transcode && tone_mapping == HdrToneMapping::Unavailable {
         return Err(Error::InvalidOutput(format!(
             "{hdr_format} video requires passthrough because HDR tone mapping is unavailable; declare target HDR support and compatible dimensions, or choose an SDR source"
         )));
@@ -999,7 +1011,7 @@ fn validate_hdr_output(media: &MediaInfo, output: &OutputOptions) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
-    use super::{OutputOptions, track_is_compatible, validate_hdr_output};
+    use super::{HdrToneMapping, OutputOptions, track_is_compatible, validate_hdr_output};
     use crate::{
         gst::{MediaInfo, MediaTrack, VideoCodec},
         hls::TrackKind,
@@ -1056,10 +1068,11 @@ mod tests {
             video_codecs: vec![VideoCodec::H264, VideoCodec::H265],
             ..OutputOptions::default()
         };
-        assert!(validate_hdr_output(&media, &output).is_err());
+        assert!(validate_hdr_output(&media, &output, HdrToneMapping::Unavailable).is_err());
         output.hdr_formats.push("HDR10".to_owned());
-        assert!(validate_hdr_output(&media, &output).is_ok());
+        assert!(validate_hdr_output(&media, &output, HdrToneMapping::Unavailable).is_ok());
         output.max_width = 1920;
-        assert!(validate_hdr_output(&media, &output).is_err());
+        assert!(validate_hdr_output(&media, &output, HdrToneMapping::Unavailable).is_err());
+        assert!(validate_hdr_output(&media, &output, HdrToneMapping::Va).is_ok());
     }
 }

@@ -51,6 +51,20 @@ async fn tauri_host_keeps_admin_local_and_cast_surface_media_only() -> TestResul
     let cache = tempfile::tempdir()?;
     let host = spawn_tauri_host(Config::loopback(cache.path()), "127.0.0.1:0".parse()?).await?;
     let client = reqwest::Client::new();
+    let admin_health = format!("{}/health", host.admin_origin());
+    assert_eq!(
+        client.get(&admin_health).send().await?.status(),
+        StatusCode::UNAUTHORIZED,
+    );
+    assert_eq!(
+        client
+            .get(&admin_health)
+            .bearer_auth(host.admin_token())
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK,
+    );
     let health = host
         .cast_url("127.0.0.1".parse()?, "/health")
         .ok_or_else(|| io::Error::other("cast URL is unavailable"))?;
@@ -69,6 +83,7 @@ async fn tauri_host_keeps_admin_local_and_cast_surface_media_only() -> TestResul
         StatusCode::NOT_FOUND
     );
     assert!(host.admin_origin().starts_with("http://127.0.0.1:"));
+    assert!(!health.contains(host.admin_token()));
     host.shutdown().await?;
     Ok(())
 }
@@ -165,6 +180,66 @@ async fn remote_http_transmux_is_seekable_deduplicated_and_playable() -> TestRes
     validate_media_segment(&repaired)?;
 
     play_hls(format!("{server_url}/v1/sessions/{id}/master.m3u8")).await?;
+    origin_task.abort();
+    server_task.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h264_long_gop_falls_back_to_exact_keyframe_transcode() -> TestResult {
+    air_transcode::initialize()?;
+    let fixtures = tempfile::tempdir()?;
+    let fixture = fixtures.path().join("long-gop.mp4");
+    generate_fixture(&fixture, FixtureKind::H264LongGop)?;
+
+    let origin_state = OriginState {
+        bytes: Arc::new(std::fs::read(&fixture)?),
+        range_requests: Arc::new(AtomicUsize::new(0)),
+    };
+    let origin = Router::new()
+        .route("/media", get(origin_media))
+        .with_state(origin_state);
+    let (origin_url, origin_task) = spawn(origin).await?;
+    let (server_url, server_task, _cache) = spawn_transcoder().await?;
+    let client = reqwest::Client::new();
+    let session = create_session(&client, &server_url, &origin_url).await?;
+    assert_eq!(session["renditions"][0]["mode"], "transmux");
+    let id = json_string(&session, "id")?;
+
+    let segment = fetch_bytes(
+        &client,
+        format!("{server_url}/v1/sessions/{id}/video/segments/2"),
+    )
+    .await?;
+    validate_media_segment(&segment)?;
+    assert!(decode_time(&segment).is_some_and(|value| value > 0));
+
+    let mut metrics = Value::Null;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        metrics = client
+            .get(format!("{server_url}/v1/metrics"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if metrics["generated_segments"]
+            .as_u64()
+            .is_some_and(|n| n >= 2)
+            && metrics["active_pipelines"] == 0
+        {
+            break;
+        }
+    }
+    assert!(
+        metrics["transcode_segments"]
+            .as_u64()
+            .is_some_and(|n| n >= 1)
+    );
+    assert_eq!(metrics["active_pipelines"], 0);
+    assert_eq!(metrics["failed_pipelines"], 0);
+
     origin_task.abort();
     server_task.abort();
     Ok(())
@@ -788,6 +863,7 @@ async fn origin_media(
 #[derive(Clone, Copy)]
 enum FixtureKind {
     H264Aac,
+    H264LongGop,
     H265Aac,
     Av1Aac,
     Vp9Opus,
@@ -831,6 +907,10 @@ fn generate_fixture(path: &Path, kind: FixtureKind) -> TestResult {
             "mp4mux name=mux ! filesink location={} videotestsrc num-buffers=180 pattern=smpte horizontal-speed=3 ! video/x-raw,format=I420,width=320,height=180,framerate=30/1 ! x264enc speed-preset=ultrafast tune=zerolatency key-int-max=30 bframes=0 byte-stream=false ! h264parse ! queue ! mux.",
             path.display()
         ),
+        FixtureKind::H264LongGop => format!(
+            "mp4mux name=mux ! filesink location={} videotestsrc num-buffers=300 pattern=smpte horizontal-speed=3 ! video/x-raw,format=I420,width=320,height=180,framerate=30/1 ! x264enc speed-preset=ultrafast tune=zerolatency key-int-max=300 bframes=0 byte-stream=false ! h264parse ! queue ! mux.",
+            path.display()
+        ),
         FixtureKind::H265Aac => format!(
             "matroskamux name=mux ! filesink location={} videotestsrc num-buffers=90 pattern=smpte horizontal-speed=3 ! video/x-raw,format=I420,width=320,height=180,framerate=30/1 ! x265enc speed-preset=ultrafast tune=zerolatency key-int-max=30 ! h265parse ! queue ! mux.",
             path.display()
@@ -851,7 +931,7 @@ fn generate_fixture(path: &Path, kind: FixtureKind) -> TestResult {
         }
     };
     let audio = match kind {
-        FixtureKind::H264Aac => {
+        FixtureKind::H264Aac | FixtureKind::H264LongGop => {
             "audiotestsrc num-buffers=282 wave=white-noise ! audio/x-raw,rate=48000,channels=2 ! avenc_aac ! aacparse ! queue ! mux."
         }
         FixtureKind::H265Aac | FixtureKind::Av1Aac => {

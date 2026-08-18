@@ -27,14 +27,31 @@ pub struct Capabilities {
     pub aac_encoders: Vec<EncoderCandidate>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HdrToneMapping {
+    Va,
     Unavailable,
 }
 
 fn available(name: &str) -> bool {
     gst::ElementFactory::find(name).is_some()
+}
+
+#[must_use]
+pub fn hdr_tone_mapping() -> HdrToneMapping {
+    let va_encoder = encoder_candidates(TrackKind::Video)
+        .iter()
+        .any(|candidate| candidate.element.starts_with("va"));
+    let va_postprocess = gst::ElementFactory::make("vapostproc")
+        .build()
+        .ok()
+        .is_some_and(|element| element.find_property("hdr-tone-mapping").is_some());
+    if va_encoder && va_postprocess {
+        HdrToneMapping::Va
+    } else {
+        HdrToneMapping::Unavailable
+    }
 }
 
 pub fn encoder_candidates(track: TrackKind) -> Vec<EncoderCandidate> {
@@ -120,7 +137,7 @@ pub fn inspect_capabilities() -> Capabilities {
         .into_iter()
         .any(available),
         transmux_video_codecs,
-        hdr_tone_mapping: HdrToneMapping::Unavailable,
+        hdr_tone_mapping: hdr_tone_mapping(),
         subtitle_inputs,
         subtitle_output: "webvtt".to_owned(),
         h264_encoders: encoder_candidates(TrackKind::Video),

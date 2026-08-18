@@ -11,6 +11,7 @@ The server prefers a zero-decode path. H.264/AAC are the conservative defaults; 
 - Complete VOD playlists with a stable duration and `#EXT-X-ENDLIST` from the first request.
 - HLS v7 CMAF output: independent video/audio init segments and `.m4s` media fragments.
 - Direct H.264/AAC transmuxing when profile, chroma format, bit depth, channel count, and requested dimensions are browser-compatible.
+- Per-segment keyframe verification: aligned H.264 stays zero-copy, while a long-GOP seek that lands on an older keyframe automatically retries through exact-keyframe H.264 transcoding within the original deadline.
 - Opt-in HEVC and validated eight-bit AV1 CMAF transmux for capable clients, including H.265 DTS reconstruction for Matroska sources. Ten-bit Matroska AV1 takes the conservative H.264 path through a seek-safe `uridecodebin` pipeline because `decodebin3` can abort on real-source AV1 flush seeks.
 - H.264/AAC transcoding with runtime-ranked hardware encoders and automatic fallback.
 - Default 1080p output ceiling without upscaling smaller sources.
@@ -23,7 +24,7 @@ The server prefers a zero-decode path. H.264/AAC are the conservative defaults; 
 - Correct per-segment `tfdt` offsets across independent seek pipelines.
 - Duplicate-request coalescing, bounded concurrency, far-seek cancellation, session TTLs, and bounded per-session caches.
 - Cache corruption detection and regeneration before serving.
-- Linux implementation plus platform-neutral Rust code paths for Windows and Android GStreamer distributions.
+- Linux runtime implementation, a native Windows CI lane against the official MSVC GStreamer SDK, and platform-neutral Rust code paths for Android GStreamer distributions.
 - Metrics for generated, cached, transmuxed, transcoded, failed, cancelled, active, and peak-active work.
 - No production source downloader: local fixture generation and any downloaded samples are test-only.
 
@@ -80,13 +81,15 @@ let host = air_transcode::spawn_tauri_host(
 ).await?;
 
 let admin_origin = host.admin_origin();
+let admin_token = host.admin_token();
 let tv_url = host.cast_url(lan_ip, &session.master_url);
 ```
 
-The administrative session API remains loopback-only. The LAN listener is
-read-only and mounted beneath a random per-process token, so the TV can fetch
-only manifests and media for session IDs it receives. `host.shutdown()` stops
-both listeners.
+Inject `admin_origin` plus `Authorization: Bearer ${admin_token}` into the
+WebView-side `@get-air/transcode` client. The administrative session API remains
+loopback-only and bearer-protected. The LAN listener is read-only and mounted
+beneath a different random per-process token, so the TV can fetch only manifests
+and media for session IDs it receives. `host.shutdown()` stops both listeners.
 
 Register a source. Credentials belong in headers, not in the TV- or browser-facing HLS URL. The server reads the source on demand and never materializes the complete input as a product feature:
 
@@ -116,7 +119,7 @@ curl http://127.0.0.1:11471/v1/sessions \
   }'
 ```
 
-Play the returned `master_url` with an HLS/MSE player such as hls.js. Its audio and subtitle track lists map directly to the HLS rendition groups, so changing `audioTrack` or `subtitleTrack` does not recreate the server session. Only add `"h265"` or `"av1"` to `video_codecs` after checking the actual browser/device decoder. For HDR, passthrough preserves the encoded signal; this build reports `hdr_tone_mapping: "unavailable"` and will not pretend that an eight-bit color conversion is correct tone mapping.
+Play the returned `master_url` with an HLS/MSE player such as hls.js. Its audio and subtitle track lists map directly to the HLS rendition groups, so changing `audioTrack` or `subtitleTrack` does not recreate the server session. Only add `"h265"` or `"av1"` to `video_codecs` after checking the actual browser/device decoder. For HDR, passthrough preserves the encoded signal. Machines whose VA driver exposes GStreamer's `hdr-tone-mapping` property report `hdr_tone_mapping: "va"` and can produce SDR through the hardware path; other machines report `"unavailable"` and reject fake eight-bit conversion.
 
 ## Test
 
@@ -133,7 +136,7 @@ See [API](docs/API.md), [architecture](docs/ARCHITECTURE.md), [compatibility](do
 
 ## Status
 
-This repository is under active development. Primary video plus indexed multi-audio and embedded/external text-subtitle renditions are functional and tested. Bitmap subtitles, exact arbitrary-keyframe transmux maps, Android packaging, and browser-matrix automation remain release gates rather than silently claimed support.
+This repository is under active development. Primary video plus indexed multi-audio and embedded/external text-subtitle renditions are functional and tested. Bitmap subtitles, exact arbitrary-keyframe handling for opt-in HEVC/AV1 passthrough, Android packaging, and browser-matrix automation remain release gates rather than silently claimed support.
 
 ## License
 
