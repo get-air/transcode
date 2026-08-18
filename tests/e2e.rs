@@ -876,7 +876,7 @@ fn generate_fixture(path: &Path, kind: FixtureKind) -> TestResult {
         return run_pipeline(
             &format!(
                 "mp4mux name=mux ! filesink location={} audiotestsrc num-buffers=282 wave=sine freq=440 ! audio/x-raw,rate=48000,channels=2 ! avenc_aac ! aacparse ! queue ! mux. audiotestsrc num-buffers=282 wave=sine freq=880 ! audio/x-raw,rate=48000,channels=2 ! avenc_aac ! aacparse ! queue ! mux.",
-                path.display()
+                gst_launch_path(path)
             ),
             Duration::from_secs(20),
         );
@@ -895,9 +895,9 @@ fn generate_fixture(path: &Path, kind: FixtureKind) -> TestResult {
         return run_pipeline(
             &format!(
                 "matroskamux name=mux min-index-interval=1000000000 ! filesink location={} videotestsrc num-buffers=180 pattern=smpte ! video/x-raw,format=I420,width=320,height=180,framerate=30/1 ! x264enc speed-preset=ultrafast tune=zerolatency key-int-max=30 bframes=0 byte-stream=false ! h264parse ! queue ! mux. audiotestsrc num-buffers=282 wave=sine freq=440 ! audio/x-raw,rate=48000,channels=2 ! avenc_aac ! taginject tags=\"language-code=en,title=English\" ! aacparse ! queue ! mux. audiotestsrc num-buffers=282 wave=sine freq=880 ! audio/x-raw,rate=48000,channels=2 ! avenc_aac ! taginject tags=\"language-code=es,title=Spanish\" ! aacparse ! queue ! mux. filesrc location={} ! subparse ! taginject tags=\"language-code=en,title=English\" ! queue ! mux. filesrc location={} ! subparse ! taginject tags=\"language-code=es,title=Spanish\" ! queue ! mux.",
-                path.display(),
-                english.display(),
-                spanish.display()
+                gst_launch_path(path),
+                gst_launch_path(&english),
+                gst_launch_path(&spanish)
             ),
             Duration::from_secs(30),
         );
@@ -905,23 +905,23 @@ fn generate_fixture(path: &Path, kind: FixtureKind) -> TestResult {
     let mux_and_video = match kind {
         FixtureKind::H264Aac => format!(
             "mp4mux name=mux ! filesink location={} videotestsrc num-buffers=180 pattern=smpte horizontal-speed=3 ! video/x-raw,format=I420,width=320,height=180,framerate=30/1 ! x264enc speed-preset=ultrafast tune=zerolatency key-int-max=30 bframes=0 byte-stream=false ! h264parse ! queue ! mux.",
-            path.display()
+            gst_launch_path(path)
         ),
         FixtureKind::H264LongGop => format!(
             "mp4mux name=mux ! filesink location={} videotestsrc num-buffers=300 pattern=smpte horizontal-speed=3 ! video/x-raw,format=I420,width=320,height=180,framerate=30/1 ! x264enc speed-preset=ultrafast tune=zerolatency key-int-max=300 bframes=0 byte-stream=false ! h264parse ! queue ! mux.",
-            path.display()
+            gst_launch_path(path)
         ),
         FixtureKind::H265Aac => format!(
             "matroskamux name=mux ! filesink location={} videotestsrc num-buffers=90 pattern=smpte horizontal-speed=3 ! video/x-raw,format=I420,width=320,height=180,framerate=30/1 ! x265enc speed-preset=ultrafast tune=zerolatency key-int-max=30 ! h265parse ! queue ! mux.",
-            path.display()
+            gst_launch_path(path)
         ),
         FixtureKind::Av1Aac => format!(
             "matroskamux name=mux ! filesink location={} videotestsrc num-buffers=60 pattern=ball animation-mode=frames ! video/x-raw,format=I420,width=320,height=180,framerate=30/1 ! av1enc cpu-used=8 threads=4 keyframe-max-dist=30 ! av1parse ! queue ! mux.",
-            path.display()
+            gst_launch_path(path)
         ),
         FixtureKind::Vp9Opus => format!(
             "matroskamux name=mux ! filesink location={} videotestsrc num-buffers=180 pattern=ball animation-mode=frames ! video/x-raw,width=320,height=180,framerate=30/1 ! vp9enc deadline=1 keyframe-max-dist=30 ! queue ! mux.",
-            path.display()
+            gst_launch_path(path)
         ),
         FixtureKind::MultiAac => {
             return Err(io::Error::other("multi-audio fixture returned too late").into());
@@ -948,6 +948,11 @@ fn generate_fixture(path: &Path, kind: FixtureKind) -> TestResult {
         }
     };
     run_pipeline(&format!("{mux_and_video} {audio}"), Duration::from_secs(20))
+}
+
+fn gst_launch_path(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    format!("\"{}\"", normalized.replace('"', "\\\""))
 }
 
 async fn play_hls(uri: String) -> TestResult {
