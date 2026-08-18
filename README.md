@@ -9,6 +9,9 @@ The server prefers a zero-decode path. H.264/AAC are the conservative defaults; 
 - Authenticated remote HTTP sources with caller-provided headers kept in memory.
 - A tokenized, range-preserving source relay for browser demuxers such as
   MediaBunny when the upstream media origin does not grant CORS access.
+- Deduplicated source registration resolves redirecting providers once, pins
+  the final CDN URL, shares probe metadata across sessions, and circuit-breaks
+  HTTP 429 responses using `Retry-After`.
 - GStreamer discovery for duration, seekability, container, codecs, complete caps, bit depth, colorimetry, HDR signals, dimensions, channels, and language.
 - Complete VOD playlists with a stable duration and `#EXT-X-ENDLIST` from the first request.
 - HLS v7 CMAF output: independent video/audio init segments and `.m4s` media fragments.
@@ -94,6 +97,22 @@ beneath a different random per-process token, so the TV can fetch only manifests
 and media for session IDs it receives. `host.shutdown()` stops both listeners.
 
 Register a source. Credentials belong in headers, not in the TV- or browser-facing HLS URL. The server reads the source on demand and never materializes the complete input as a product feature:
+
+```bash
+SOURCE_ID=$(curl -fsS http://127.0.0.1:11471/v1/sources \
+  --header 'content-type: application/json' \
+  --data '{"url":"https://media.example/video.mkv"}' | jq -r .id)
+
+curl http://127.0.0.1:11471/v1/sessions \
+  --header 'content-type: application/json' \
+  --data "{\"source_id\":\"$SOURCE_ID\",\"output\":{\"max_width\":1920}}"
+```
+
+Inline `source` session requests remain supported and are internally
+deduplicated through the same registry. Browser byte-range readers use
+`GET /v1/sources/{id}/relay`; release the source with `DELETE /v1/sources/{id}`.
+
+The legacy inline form is:
 
 ```bash
 curl http://127.0.0.1:11471/v1/sessions \

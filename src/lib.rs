@@ -8,6 +8,7 @@ pub mod hls;
 pub mod mp4;
 pub mod server;
 pub mod session;
+pub mod source;
 
 pub use api::{AppState, app, media_app};
 pub use config::Config;

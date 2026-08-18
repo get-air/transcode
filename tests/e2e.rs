@@ -1,5 +1,6 @@
 use std::{
     error::Error as StdError,
+    fmt::Write as _,
     io,
     path::Path,
     sync::{
@@ -19,7 +20,7 @@ use axum::{
     body::Body,
     extract::State,
     http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::Response,
+    response::{IntoResponse, Redirect, Response},
     routing::get,
 };
 use gstreamer as gst;
@@ -92,6 +93,325 @@ async fn tauri_host_keeps_admin_local_and_cast_surface_media_only() -> TestResul
 struct OriginState {
     bytes: Arc<Vec<u8>>,
     range_requests: Arc<AtomicUsize>,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
+async fn source_registry_resolves_once_deduplicates_and_circuits_rate_limits() -> TestResult {
+    air_transcode::initialize()?;
+    let fixtures = tempfile::tempdir()?;
+    let fixture = fixtures.path().join("registered-source.mp4");
+    generate_fixture(&fixture, FixtureKind::H264Aac)?;
+    let resolver_requests = Arc::new(AtomicUsize::new(0));
+    let resolver_counter = Arc::clone(&resolver_requests);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let origin_state = OriginState {
+        bytes: Arc::new(std::fs::read(&fixture)?),
+        range_requests: Arc::new(AtomicUsize::new(0)),
+    };
+    let router = Router::new()
+        .route("/media", get(origin_media))
+        .route(
+            "/resolve",
+            get(move || {
+                let counter = Arc::clone(&resolver_counter);
+                async move {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    Redirect::temporary("/media")
+                }
+            }),
+        )
+        .with_state(origin_state);
+    let origin_task = tokio::spawn(async move { axum::serve(listener, router).await });
+    let origin_url = format!("http://{address}");
+    let (server_url, server_task, _cache) = spawn_transcoder().await?;
+    let client = reqwest::Client::new();
+
+    let registration = json!({
+        "url": format!("{origin_url}/resolve"),
+        "headers": { "Authorization": "Bearer fixture" }
+    });
+    let first = client
+        .post(format!("{server_url}/v1/sources"))
+        .json(&registration)
+        .send();
+    let second = client
+        .post(format!("{server_url}/v1/sources"))
+        .json(&registration)
+        .send();
+    let (first, second) = tokio::try_join!(first, second)?;
+    let source: Value = first.error_for_status()?.json().await?;
+    let second: Value = second.error_for_status()?.json().await?;
+    let source_id = json_string(&source, "id")?;
+    assert_eq!(second["id"], source["id"]);
+    for _ in 0..2 {
+        let session: Value = client
+            .post(format!("{server_url}/v1/sessions"))
+            .json(&json!({ "source_id": source_id, "output": { "max_width": 1920 } }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let session_id = json_string(&session, "id")?;
+        client
+            .delete(format!("{server_url}/v1/sessions/{session_id}"))
+            .send()
+            .await?
+            .error_for_status()?;
+    }
+    let relay = client
+        .get(format!("{server_url}/v1/sources/{source_id}/relay"))
+        .header(header::RANGE, "bytes=128-255")
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(relay.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(relay.bytes().await?.len(), 128);
+    let metrics: Value = client
+        .get(format!("{server_url}/v1/metrics"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(metrics["resolver_requests"], 1);
+    assert_eq!(resolver_requests.load(Ordering::Relaxed), 1);
+
+    let rate_requests = Arc::new(AtomicUsize::new(0));
+    let rate_counter = Arc::clone(&rate_requests);
+    let rate_router = Router::new().route(
+        "/limited",
+        get(move || {
+            let counter = Arc::clone(&rate_counter);
+            async move {
+                counter.fetch_add(1, Ordering::Relaxed);
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(header::RETRY_AFTER, "60")],
+                    "limited",
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let (rate_url, rate_task) = spawn(rate_router).await?;
+    for _ in 0..2 {
+        let response = client
+            .post(format!("{server_url}/v1/sources"))
+            .json(&json!({ "url": format!("{rate_url}/limited") }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let payload: Value = response.json().await?;
+        assert_eq!(payload["error"]["code"], "rate_limited");
+    }
+    assert_eq!(rate_requests.load(Ordering::Relaxed), 1);
+
+    let full_router =
+        Router::new().route("/full", get(|| async { (StatusCode::OK, vec![0_u8; 16]) }));
+    let (full_url, full_task) = spawn(full_router).await?;
+    let response = client
+        .post(format!("{server_url}/v1/sources"))
+        .json(&json!({ "url": format!("{full_url}/full") }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload: Value = response.json().await?;
+    assert!(
+        payload["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("byte-range"))
+    );
+
+    origin_task.abort();
+    rate_task.abort();
+    full_task.abort();
+    server_task.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expired_source_refresh_is_single_flight() -> TestResult {
+    air_transcode::initialize()?;
+    let fixtures = tempfile::tempdir()?;
+    let fixture = fixtures.path().join("refresh-source.mp4");
+    generate_fixture(&fixture, FixtureKind::H264Aac)?;
+    let origin_state = OriginState {
+        bytes: Arc::new(std::fs::read(&fixture)?),
+        range_requests: Arc::new(AtomicUsize::new(0)),
+    };
+    let expired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let resolver_requests = Arc::new(AtomicUsize::new(0));
+    let resolver_expired = Arc::clone(&expired);
+    let resolver_counter = Arc::clone(&resolver_requests);
+    let old_state = origin_state.clone();
+    let old_expired = Arc::clone(&expired);
+    let fresh_state = origin_state;
+    let router = Router::new()
+        .route(
+            "/resolve",
+            get(move || {
+                let expired = Arc::clone(&resolver_expired);
+                let counter = Arc::clone(&resolver_counter);
+                async move {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    if expired.load(Ordering::Acquire) {
+                        Redirect::temporary("/fresh")
+                    } else {
+                        Redirect::temporary("/old")
+                    }
+                }
+            }),
+        )
+        .route(
+            "/old",
+            get(move |headers| {
+                let state = old_state.clone();
+                let expired = Arc::clone(&old_expired);
+                async move {
+                    if expired.load(Ordering::Acquire) {
+                        Err(StatusCode::UNAUTHORIZED)
+                    } else {
+                        origin_media(State(state), headers).await
+                    }
+                }
+            }),
+        )
+        .route(
+            "/fresh",
+            get(move |headers| {
+                let state = fresh_state.clone();
+                async move { origin_media(State(state), headers).await }
+            }),
+        );
+    let (origin_url, origin_task) = spawn(router).await?;
+    let (server_url, server_task, _cache) = spawn_transcoder().await?;
+    let client = reqwest::Client::new();
+    let source: Value = client
+        .post(format!("{server_url}/v1/sources"))
+        .json(&json!({
+            "url": format!("{origin_url}/resolve"),
+            "headers": { "Authorization": "Bearer fixture" }
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let source_id = json_string(&source, "id")?;
+    expired.store(true, Ordering::Release);
+    let relay_url = format!("{server_url}/v1/sources/{source_id}/relay");
+    let first = client
+        .get(&relay_url)
+        .header(header::RANGE, "bytes=0-127")
+        .send();
+    let second = client
+        .get(&relay_url)
+        .header(header::RANGE, "bytes=128-255")
+        .send();
+    let (first, second) = tokio::try_join!(first, second)?;
+    assert_eq!(first.error_for_status()?.bytes().await?.len(), 128);
+    assert_eq!(second.error_for_status()?.bytes().await?.len(), 128);
+    assert_eq!(resolver_requests.load(Ordering::Relaxed), 2);
+    let metrics: Value = client
+        .get(format!("{server_url}/v1/metrics"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(metrics["source_refreshes"], 1);
+
+    origin_task.abort();
+    server_task.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bundled_audio_meets_switch_and_seek_latency_gates() -> TestResult {
+    air_transcode::initialize()?;
+    let fixtures = tempfile::tempdir()?;
+    let fixture = fixtures.path().join("eleven-audio.mkv");
+    generate_fixture(&fixture, FixtureKind::ElevenAudio)?;
+    let origin_state = OriginState {
+        bytes: Arc::new(std::fs::read(&fixture)?),
+        range_requests: Arc::new(AtomicUsize::new(0)),
+    };
+    let origin = Router::new()
+        .route("/media", get(origin_media))
+        .with_state(origin_state);
+    let (origin_url, origin_task) = spawn(origin).await?;
+    let (server_url, server_task, _cache) = spawn_transcoder().await?;
+    let client = reqwest::Client::new();
+    let session: Value = client
+        .post(format!("{server_url}/v1/sessions"))
+        .json(&json!({
+            "source": {
+                "url": format!("{origin_url}/media"),
+                "headers": { "Authorization": "Bearer fixture" }
+            },
+            "output": { "video_enabled": false, "max_width": 1920 }
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let id = json_string(&session, "id")?;
+    let audio = session["tracks"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("tracks are not an array"))?
+        .iter()
+        .filter(|track| track["kind"] == "audio")
+        .filter_map(|track| track["index"].as_u64())
+        .collect::<Vec<_>>();
+    assert_eq!(audio.len(), 11);
+
+    for operation in 0..100_usize {
+        let sequence = u32::try_from((operation * 13) % 15 + 1)?;
+        let track = audio[(operation * 5) % audio.len()];
+        let started = std::time::Instant::now();
+        fetch_bytes(
+            &client,
+            format!("{server_url}/v1/sessions/{id}/audio/{track}/segments/{sequence}"),
+        )
+        .await?;
+        assert!(
+            started.elapsed() <= Duration::from_secs(3),
+            "seek {operation} exceeded 3 seconds: {:?}",
+            started.elapsed()
+        );
+    }
+    for operation in 0..100_usize {
+        let track = audio[(operation * 7) % audio.len()];
+        let sequence = u32::try_from((operation * 11) % 15 + 1)?;
+        let started = std::time::Instant::now();
+        fetch_bytes(
+            &client,
+            format!("{server_url}/v1/sessions/{id}/audio/{track}/segments/{sequence}"),
+        )
+        .await?;
+        assert!(
+            started.elapsed() <= Duration::from_secs(2),
+            "track switch {operation} exceeded 2 seconds: {:?}",
+            started.elapsed()
+        );
+    }
+    let metrics: Value = client
+        .get(format!("{server_url}/v1/metrics"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(metrics["resolver_requests"], 1);
+    assert_eq!(metrics["failed_pipelines"], 0);
+
+    origin_task.abort();
+    server_task.abort();
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -869,9 +1189,24 @@ enum FixtureKind {
     Vp9Opus,
     MultiAac,
     MultiTrack,
+    ElevenAudio,
 }
 
 fn generate_fixture(path: &Path, kind: FixtureKind) -> TestResult {
+    if matches!(kind, FixtureKind::ElevenAudio) {
+        let mut description = format!(
+            "matroskamux name=mux min-index-interval=1000000000 ! filesink location={} videotestsrc num-buffers=900 pattern=black ! video/x-raw,format=I420,width=320,height=180,framerate=30/1 ! x264enc speed-preset=ultrafast tune=zerolatency key-int-max=30 bframes=0 byte-stream=false ! h264parse ! queue ! mux.",
+            gst_launch_path(path),
+        );
+        for index in 0..11_u32 {
+            let frequency = 220 + index * 55;
+            let _ = write!(
+                description,
+                " audiotestsrc num-buffers=1407 wave=sine freq={frequency} ! audio/x-raw,rate=48000,channels=2 ! opusenc bitrate=32000 ! taginject tags=\"language-code=en,title=Track-{index}\" ! queue ! mux.",
+            );
+        }
+        return run_pipeline(&description, Duration::from_secs(45));
+    }
     if matches!(kind, FixtureKind::MultiAac) {
         return run_pipeline(
             &format!(
@@ -930,6 +1265,9 @@ fn generate_fixture(path: &Path, kind: FixtureKind) -> TestResult {
         FixtureKind::MultiTrack => {
             return Err(io::Error::other("multi-track fixture returned too late").into());
         }
+        FixtureKind::ElevenAudio => {
+            return Err(io::Error::other("eleven-audio fixture returned too late").into());
+        }
     };
     let audio = match kind {
         FixtureKind::H264Aac | FixtureKind::H264LongGop => {
@@ -946,6 +1284,9 @@ fn generate_fixture(path: &Path, kind: FixtureKind) -> TestResult {
         }
         FixtureKind::MultiTrack => {
             return Err(io::Error::other("multi-track fixture returned too late").into());
+        }
+        FixtureKind::ElevenAudio => {
+            return Err(io::Error::other("eleven-audio fixture returned too late").into());
         }
     };
     run_pipeline(&format!("{mux_and_video} {audio}"), Duration::from_secs(20))

@@ -8,7 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tower_http::{
     catch_panic::CatchPanicLayer,
     cors::{Any, CorsLayer},
@@ -25,6 +25,7 @@ use crate::{
         subtitle_playlist,
     },
     session::{CreateSession, SessionManager, SessionView},
+    source::{SourceManager, SourceMetricsSnapshot, SourceView},
 };
 
 #[derive(Clone)]
@@ -32,6 +33,7 @@ pub struct AppState {
     pub config: Config,
     pub capabilities: Capabilities,
     pub sessions: SessionManager,
+    pub sources: SourceManager,
 }
 
 impl AppState {
@@ -41,11 +43,13 @@ impl AppState {
     ///
     /// Returns an error when the cache directory cannot be created.
     pub fn new(config: Config) -> Result<Self> {
-        let sessions = SessionManager::new(config.clone())?;
+        let sources = SourceManager::new(config.clone())?;
+        let sessions = SessionManager::new(config.clone(), sources.clone())?;
         Ok(Self {
             config,
             capabilities: inspect_capabilities(),
             sessions,
+            sources,
         })
     }
 }
@@ -55,8 +59,12 @@ pub fn app(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/metrics", get(metrics))
+        .route("/v1/sources", post(create_source))
+        .route("/v1/sources/{id}", get(get_source).delete(delete_source))
+        .route("/v1/sources/{id}/relay", get(source_relay))
         .route("/v1/sessions", post(create_session))
         .route("/v1/sessions/{id}", get(get_session).delete(delete_session))
+        .route("/v1/sessions/{id}/warm-audio", post(warm_audio))
         .merge(media_routes())
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -82,7 +90,6 @@ pub fn media_app(state: AppState) -> Router {
 fn media_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/v1/sessions/{id}/master.m3u8", get(master))
-        .route("/v1/sessions/{id}/source", get(source_relay))
         .route("/v1/sessions/{id}/video.m3u8", get(video_media))
         .route("/v1/sessions/{id}/audio.m3u8", get(audio_media))
         .route(
@@ -116,12 +123,19 @@ fn api_cors() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([http::Method::GET, http::Method::POST, http::Method::DELETE])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::RANGE])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            header::RANGE,
+            header::IF_RANGE,
+        ])
         .expose_headers([
             header::ACCEPT_RANGES,
             header::CONTENT_LENGTH,
             header::CONTENT_RANGE,
             header::CONTENT_TYPE,
+            header::ETAG,
+            header::LAST_MODIFIED,
         ])
 }
 
@@ -130,25 +144,19 @@ async fn source_relay(
     Path(id): Path<Uuid>,
     request: Request,
 ) -> Result<Response> {
-    let session = state.sessions.get(id)?;
-    let source = session.source();
-    if !matches!(source.url.scheme(), "http" | "https") {
-        return Err(Error::InvalidSource(
-            "browser source relay supports HTTP and HTTPS only".to_owned(),
-        ));
-    }
-    let client = reqwest::Client::new();
-    let mut upstream = client.request(request.method().clone(), source.url.clone());
-    for (name, value) in &source.headers {
-        upstream = upstream.header(name, value);
-    }
-    if let Some(range) = request.headers().get(header::RANGE) {
-        upstream = upstream.header(header::RANGE, range);
-    }
-    let upstream = upstream
-        .send()
-        .await
-        .map_err(|error| Error::Pipeline(format!("source relay failed: {error}")))?;
+    let source = state.sources.get(id)?;
+    let range = request
+        .headers()
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok());
+    let if_range = request
+        .headers()
+        .get(header::IF_RANGE)
+        .and_then(|value| value.to_str().ok());
+    let upstream = state
+        .sources
+        .relay(&source, request.method().clone(), range, if_range)
+        .await?;
     let status = upstream.status();
     let mut headers = HeaderMap::new();
     for name in [
@@ -169,6 +177,41 @@ async fn source_relay(
     Ok(response)
 }
 
+async fn create_source(
+    State(state): State<Arc<AppState>>,
+    Json(source): Json<crate::session::Source>,
+) -> Result<(StatusCode, Json<SourceView>)> {
+    let source = state.sources.register(source).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(SourceView {
+            id: source.id,
+            media: source.media.clone(),
+            relay_url: format!("/v1/sources/{}/relay", source.id),
+        }),
+    ))
+}
+
+async fn get_source(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<SourceView>> {
+    let source = state.sources.get(id)?;
+    Ok(Json(SourceView {
+        id,
+        media: source.media.clone(),
+        relay_url: format!("/v1/sources/{id}/relay"),
+    }))
+}
+
+async fn delete_source(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode> {
+    state.sources.release(id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(Serialize)]
 struct Health<'a> {
     status: &'a str,
@@ -186,8 +229,19 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Capabilities> 
     Json(state.capabilities.clone())
 }
 
-async fn metrics(State(state): State<Arc<AppState>>) -> Json<crate::session::MetricsSnapshot> {
-    Json(state.sessions.metrics())
+#[derive(Serialize)]
+struct CombinedMetrics {
+    #[serde(flatten)]
+    sessions: crate::session::MetricsSnapshot,
+    #[serde(flatten)]
+    sources: SourceMetricsSnapshot,
+}
+
+async fn metrics(State(state): State<Arc<AppState>>) -> Json<CombinedMetrics> {
+    Json(CombinedMetrics {
+        sessions: state.sessions.metrics(),
+        sources: state.sources.metrics(),
+    })
 }
 
 async fn create_session(
@@ -211,6 +265,34 @@ async fn delete_session(
 ) -> Result<StatusCode> {
     state.sessions.remove(id)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct WarmAudioRequest {
+    position_seconds: f64,
+}
+
+#[derive(Serialize)]
+struct WarmAudioResponse {
+    sequence: u32,
+    elapsed_ms: u64,
+}
+
+async fn warm_audio(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    Json(request): Json<WarmAudioRequest>,
+) -> Result<Json<WarmAudioResponse>> {
+    let session = state.sessions.get(id)?;
+    let started = std::time::Instant::now();
+    let sequence = state
+        .sessions
+        .warm_audio(session, request.position_seconds)
+        .await?;
+    Ok(Json(WarmAudioResponse {
+        sequence,
+        elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    }))
 }
 
 async fn master(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> Result<Response> {

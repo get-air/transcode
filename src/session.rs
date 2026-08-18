@@ -20,25 +20,27 @@ use crate::{
     config::Config,
     error::{Error, Result},
     gst::{
-        HdrToneMapping, MediaInfo, PipelineMode, ProbeRequest, SegmentArtifact, SegmentRequest,
-        SubtitleArtifact, SubtitleRequest, VideoCodec, generate_segment, generate_subtitle_segment,
-        hdr_tone_mapping, probe,
+        AudioBundleRequest, AudioBundleTrack, HdrToneMapping, MediaInfo, PipelineMode,
+        SegmentArtifact, SegmentRequest, SubtitleArtifact, SubtitleRequest, VideoCodec,
+        generate_audio_bundle, generate_segment, generate_subtitle_segment, hdr_tone_mapping,
     },
     hls::{SegmentSpec, TrackKind, segment_map},
+    source::{RegisteredSource, SourceManager},
 };
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct CreateSession {
-    pub source: Source,
     #[serde(default)]
-    pub relay_only: bool,
+    pub source: Option<Source>,
+    #[serde(default)]
+    pub source_id: Option<Uuid>,
     #[serde(default)]
     pub output: OutputOptions,
     #[serde(default)]
     pub subtitles: Vec<ExternalSubtitle>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Source {
     pub url: Url,
     #[serde(default)]
@@ -61,6 +63,8 @@ pub struct OutputOptions {
     pub transmux: bool,
     #[serde(default)]
     pub force_transcode: bool,
+    #[serde(default = "default_true")]
+    pub video_enabled: bool,
     #[serde(default = "default_max_width")]
     pub max_width: u32,
     #[serde(default = "default_max_height")]
@@ -83,6 +87,7 @@ impl Default for OutputOptions {
         Self {
             transmux: true,
             force_transcode: false,
+            video_enabled: true,
             max_width: default_max_width(),
             max_height: default_max_height(),
             video_track_index: None,
@@ -113,6 +118,7 @@ const fn default_max_height() -> u32 {
 #[derive(Clone, Debug, Serialize)]
 pub struct SessionView {
     pub id: Uuid,
+    pub source_id: Uuid,
     pub duration_ns: u64,
     pub seekable: bool,
     pub tracks: Vec<crate::gst::MediaTrack>,
@@ -134,13 +140,15 @@ pub struct RenditionView {
 
 pub struct Session {
     pub id: Uuid,
-    pub source: Source,
+    pub source: Arc<RegisteredSource>,
     pub output: OutputOptions,
     pub media: MediaInfo,
     pub segments: Vec<SegmentSpec>,
     pub directory: PathBuf,
     external_subtitles: HashMap<usize, ExternalSubtitle>,
     segment_locks: DashMap<(TrackKind, usize, u32), Arc<tokio::sync::Mutex<()>>>,
+    audio_bundle_locks: DashMap<u32, Arc<tokio::sync::Mutex<()>>>,
+    active_audio_bundle: Mutex<Option<(u32, CancellationToken)>>,
     subtitle_locks: DashMap<(usize, u32), Arc<tokio::sync::Mutex<()>>>,
     prefetch_suppressed: DashMap<(TrackKind, usize, u32), ()>,
     active_requests: Mutex<HashMap<(TrackKind, usize), Vec<ActiveRequest>>>,
@@ -154,10 +162,6 @@ struct ActiveRequest {
 }
 
 impl Session {
-    pub const fn source(&self) -> &Source {
-        &self.source
-    }
-
     #[must_use]
     pub fn view(&self) -> SessionView {
         let renditions = self
@@ -205,6 +209,7 @@ impl Session {
             .collect();
         SessionView {
             id: self.id,
+            source_id: self.source.id,
             duration_ns: self.media.duration_ns,
             seekable: self.media.seekable,
             tracks: self.media.tracks.clone(),
@@ -296,6 +301,9 @@ impl Session {
 
     #[must_use]
     pub fn selected_track(&self, kind: TrackKind) -> Option<&crate::gst::MediaTrack> {
+        if kind == TrackKind::Video && !self.output.video_enabled {
+            return None;
+        }
         let requested_index = match kind {
             TrackKind::Video => self.output.video_track_index,
             TrackKind::Audio => self.output.audio_track_index,
@@ -354,6 +362,7 @@ pub struct SessionManager {
     pipelines: Arc<Semaphore>,
     metrics: Arc<Metrics>,
     hdr_tone_mapping: HdrToneMapping,
+    sources: SourceManager,
 }
 
 #[derive(Default)]
@@ -367,6 +376,7 @@ struct Metrics {
     transcode_segments: AtomicU64,
     subtitle_segments: AtomicU64,
     cancelled_pipelines: AtomicU64,
+    pipeline_queue_ns: AtomicU64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -380,6 +390,7 @@ pub struct MetricsSnapshot {
     pub transcode_segments: u64,
     pub subtitle_segments: u64,
     pub cancelled_pipelines: u64,
+    pub pipeline_queue_wait_ms: u64,
 }
 
 struct ActivePipelineGuard<'a>(&'a Metrics);
@@ -409,6 +420,7 @@ impl Metrics {
             transcode_segments: self.transcode_segments.load(Ordering::Relaxed),
             subtitle_segments: self.subtitle_segments.load(Ordering::Relaxed),
             cancelled_pipelines: self.cancelled_pipelines.load(Ordering::Relaxed),
+            pipeline_queue_wait_ms: self.pipeline_queue_ns.load(Ordering::Relaxed) / 1_000_000,
         }
     }
 }
@@ -419,7 +431,7 @@ impl SessionManager {
     /// # Errors
     ///
     /// Returns an error when the cache root cannot be created.
-    pub fn new(config: Config) -> Result<Self> {
+    pub fn new(config: Config, sources: SourceManager) -> Result<Self> {
         std::fs::create_dir_all(&config.cache_dir)?;
         Ok(Self {
             pipelines: Arc::new(Semaphore::new(config.max_pipelines.max(1))),
@@ -427,6 +439,7 @@ impl SessionManager {
             metrics: Arc::new(Metrics::default()),
             sessions: Arc::new(DashMap::new()),
             hdr_tone_mapping: hdr_tone_mapping(),
+            sources,
         })
     }
 
@@ -436,7 +449,6 @@ impl SessionManager {
     ///
     /// Returns an error when discovery, task execution, or cache setup fails.
     pub async fn create(&self, request: CreateSession) -> Result<Arc<Session>> {
-        validate_source(&request.source)?;
         if request.subtitles.len() > 64 {
             return Err(Error::InvalidOutput(
                 "a session may include at most 64 external subtitles".to_owned(),
@@ -466,14 +478,19 @@ impl SessionManager {
         }
         self.evict_expired();
         self.evict_over_capacity();
-        let probe_request = ProbeRequest {
-            url: request.source.url.clone(),
-            headers: request.source.headers.clone(),
-            timeout: self.config.probe_timeout(),
+        let source = match (request.source_id, request.source) {
+            (Some(id), None) => self.sources.acquire(id)?,
+            (None, Some(source)) => {
+                let registered = self.sources.register(source).await?;
+                self.sources.acquire(registered.id)?
+            }
+            _ => {
+                return Err(Error::InvalidSource(
+                    "exactly one of source or source_id is required".to_owned(),
+                ));
+            }
         };
-        let mut media = tokio::task::spawn_blocking(move || probe(&probe_request))
-            .await
-            .map_err(|error| Error::Task(error.to_string()))??;
+        let mut media = source.media.clone();
         let mut external_subtitles = HashMap::new();
         for subtitle in request.subtitles {
             let index = media.tracks.len();
@@ -498,23 +515,30 @@ impl SessionManager {
             });
             external_subtitles.insert(index, subtitle);
         }
-        if !request.relay_only {
-            validate_track_selection(&media, &request.output)?;
-            validate_hdr_output(&media, &request.output, self.hdr_tone_mapping)?;
+        if let Err(error) = validate_track_selection(&media, &request.output)
+            .and_then(|()| validate_hdr_output(&media, &request.output, self.hdr_tone_mapping))
+        {
+            let _ = self.sources.release(source.id);
+            return Err(error);
         }
         let id = Uuid::new_v4();
         let directory = self.config.cache_dir.join(id.to_string());
-        std::fs::create_dir_all(&directory)?;
+        if let Err(error) = std::fs::create_dir_all(&directory) {
+            let _ = self.sources.release(source.id);
+            return Err(error.into());
+        }
         let target_ns = u64::from(self.config.segment_seconds) * 1_000_000_000;
         let session = Arc::new(Session {
             id,
-            source: request.source,
+            source,
             output: request.output,
             segments: segment_map(media.duration_ns, target_ns),
             media,
             directory,
             external_subtitles,
             segment_locks: DashMap::new(),
+            audio_bundle_locks: DashMap::new(),
+            active_audio_bundle: Mutex::new(None),
             subtitle_locks: DashMap::new(),
             prefetch_suppressed: DashMap::new(),
             active_requests: Mutex::new(HashMap::new()),
@@ -552,6 +576,7 @@ impl SessionManager {
         if session.directory.is_dir() {
             std::fs::remove_dir_all(&session.directory)?;
         }
+        let _ = self.sources.release_session(session.source.id);
         Ok(())
     }
 
@@ -601,6 +626,10 @@ impl SessionManager {
         {
             return Err(Error::TrackNotFound(track.as_str().to_owned()));
         }
+        let mode = session.mode_for(track, track_index);
+        if track == TrackKind::Audio && matches!(mode, PipelineMode::Transcode) {
+            return self.audio_bundle_for(session, track_index, sequence).await;
+        }
         let segment = session
             .segments
             .iter()
@@ -630,14 +659,14 @@ impl SessionManager {
             });
             drop(active);
         }
-        let mode = session.mode_for(track, track_index);
         let tone_map_hdr = track == TrackKind::Video
             && matches!(mode, PipelineMode::Transcode)
             && selected_track.hdr_format.is_some()
             && self.hdr_tone_mapping == HdrToneMapping::Va;
+        let (resolved_url, resolved_headers) = session.source.resolved();
         let request = SegmentRequest {
-            source: session.source.url.clone(),
-            headers: session.source.headers.clone(),
+            source: resolved_url,
+            headers: resolved_headers,
             track,
             segment,
             mode,
@@ -654,10 +683,15 @@ impl SessionManager {
             tone_map_hdr,
         };
         let cancel_on_drop = cancellation.drop_guard();
+        let queue_started = Instant::now();
         let permit = Arc::clone(&self.pipelines)
             .acquire_owned()
             .await
             .map_err(|error| Error::Task(error.to_string()))?;
+        self.metrics.pipeline_queue_ns.fetch_add(
+            u64::try_from(queue_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         let metrics = Arc::clone(&self.metrics);
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -723,6 +757,159 @@ impl SessionManager {
         result
     }
 
+    #[allow(clippy::too_many_lines)]
+    async fn audio_bundle_for(
+        &self,
+        session: Arc<Session>,
+        track_index: usize,
+        sequence: u32,
+    ) -> Result<SegmentArtifact> {
+        let segment = session
+            .segments
+            .iter()
+            .find(|segment| segment.sequence == sequence)
+            .cloned()
+            .ok_or(Error::SegmentOutOfRange { sequence })?;
+        let lock = session
+            .audio_bundle_locks
+            .entry(sequence)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+        let target_dir = session
+            .directory
+            .join("audio")
+            .join(track_index.to_string())
+            .join(sequence.to_string());
+        let target_init = target_dir.join("init.mp4");
+        let target_segment = target_dir.join("segment.m4s");
+        if target_init.is_file() && target_segment.is_file() {
+            self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(SegmentArtifact {
+                init_path: target_init,
+                segment_path: target_segment,
+                mode: PipelineMode::Transcode,
+                cached: true,
+            });
+        }
+        let cancellation = CancellationToken::new();
+        {
+            let mut active = session.active_audio_bundle.lock();
+            if let Some((active_sequence, active_token)) = active.as_ref()
+                && active_sequence.abs_diff(sequence) > 1
+            {
+                active_token.cancel();
+            }
+            *active = Some((sequence, cancellation.clone()));
+        }
+        let tracks = session
+            .tracks("audio")
+            .map(|track| AudioBundleTrack {
+                index: track.index,
+                stream_id: track.stream_id.clone(),
+                output_dir: session
+                    .directory
+                    .join("audio")
+                    .join(track.index.to_string())
+                    .join(sequence.to_string()),
+            })
+            .collect::<Vec<_>>();
+        let (source, headers) = session.source.resolved();
+        let request = AudioBundleRequest {
+            source,
+            headers,
+            tracks,
+            segment,
+            timeout: Duration::from_secs(3),
+            cancellation: cancellation.clone(),
+        };
+        let queue_started = Instant::now();
+        let permit = Arc::clone(&self.pipelines)
+            .acquire_owned()
+            .await
+            .map_err(|error| Error::Task(error.to_string()))?;
+        self.metrics.pipeline_queue_ns.fetch_add(
+            u64::try_from(queue_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        let metrics = Arc::clone(&self.metrics);
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let _active = metrics.enter();
+            generate_audio_bundle(&request)
+        })
+        .await
+        .map_err(|error| Error::Task(error.to_string()))?;
+        session.active_audio_bundle.lock().take();
+        let artifacts = match result {
+            Ok(artifacts) => artifacts,
+            Err(Error::Cancelled) => {
+                self.metrics
+                    .cancelled_pipelines
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(Error::Cancelled);
+            }
+            Err(error) => {
+                self.metrics
+                    .failed_pipelines
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
+        let generated = artifacts.iter().filter(|artifact| !artifact.cached).count();
+        self.metrics.generated_segments.fetch_add(
+            u64::try_from(generated).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.metrics.transcode_segments.fetch_add(
+            u64::try_from(generated).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.prune_session_cache(&session)?;
+        artifacts
+            .into_iter()
+            .find(|artifact| artifact.init_path == target_init)
+            .ok_or_else(|| {
+                Error::Pipeline(format!(
+                    "audio bundle did not produce track {track_index} segment {sequence}",
+                ))
+            })
+    }
+
+    /// Warms every audio rendition covering the requested playback position.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the position is outside the timeline or bundled
+    /// audio generation fails.
+    pub async fn warm_audio(&self, session: Arc<Session>, position_seconds: f64) -> Result<u32> {
+        let position_ns = if position_seconds.is_finite() && position_seconds > 0.0 {
+            Duration::from_secs_f64(position_seconds).as_nanos()
+        } else {
+            0
+        };
+        let position_ns = u64::try_from(position_ns).unwrap_or(u64::MAX);
+        let sequence = session
+            .segments
+            .iter()
+            .find(|segment| {
+                segment.start_ns <= position_ns
+                    && position_ns < segment.start_ns.saturating_add(segment.duration_ns)
+            })
+            .or_else(|| session.segments.last())
+            .map(|segment| segment.sequence)
+            .ok_or(Error::SegmentOutOfRange { sequence: 0 })?;
+        let track_index = session
+            .tracks("audio")
+            .next()
+            .map(|track| track.index)
+            .ok_or_else(|| Error::TrackNotFound("audio".to_owned()))?;
+        let _ = self
+            .audio_bundle_for(session, track_index, sequence)
+            .await?;
+        Ok(sequence)
+    }
+
     /// Generates a `WebVTT` subtitle segment for a discovered text track.
     ///
     /// # Errors
@@ -741,7 +928,10 @@ impl SessionManager {
             .ok_or_else(|| Error::TrackNotFound(format!("subtitle {track_index}")))?;
         let (source, selected_stream_id, timestamp_offset_ns) =
             session.external_subtitles.get(&track_index).map_or_else(
-                || (session.source.clone(), track.stream_id.clone(), 0_i64),
+                || {
+                    let (url, headers) = session.source.resolved();
+                    (Source { url, headers }, track.stream_id.clone(), 0_i64)
+                },
                 |subtitle| {
                     (
                         subtitle.source.clone(),
@@ -778,10 +968,15 @@ impl SessionManager {
             timestamp_offset_ns,
         };
         let cancel_on_drop = cancellation.drop_guard();
+        let queue_started = Instant::now();
         let permit = Arc::clone(&self.pipelines)
             .acquire_owned()
             .await
             .map_err(|error| Error::Task(error.to_string()))?;
+        self.metrics.pipeline_queue_ns.fetch_add(
+            u64::try_from(queue_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         let metrics = Arc::clone(&self.metrics);
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -831,7 +1026,7 @@ impl SessionManager {
         let manager = self.clone();
         let _prefetch = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(25)).await;
-            if manager.pipelines.available_permits() == 0 {
+            if manager.pipelines.available_permits() <= 1 {
                 session
                     .prefetch_suppressed
                     .remove(&(track, track_index, sequence));
@@ -911,7 +1106,7 @@ impl SessionManager {
     }
 }
 
-fn validate_source(source: &Source) -> Result<()> {
+pub(crate) fn validate_source(source: &Source) -> Result<()> {
     if !matches!(source.url.scheme(), "http" | "https" | "file") {
         return Err(Error::InvalidSource(format!(
             "scheme {} is not supported",
@@ -995,6 +1190,9 @@ fn validate_hdr_output(
     output: &OutputOptions,
     tone_mapping: HdrToneMapping,
 ) -> Result<()> {
+    if !output.video_enabled {
+        return Ok(());
+    }
     let video = media.tracks.iter().find(|track| {
         track.kind == "video"
             && output

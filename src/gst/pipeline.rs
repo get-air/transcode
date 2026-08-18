@@ -58,6 +58,23 @@ pub struct SegmentArtifact {
 }
 
 #[derive(Clone, Debug)]
+pub struct AudioBundleTrack {
+    pub index: usize,
+    pub stream_id: Option<String>,
+    pub output_dir: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioBundleRequest {
+    pub source: Url,
+    pub headers: BTreeMap<String, String>,
+    pub tracks: Vec<AudioBundleTrack>,
+    pub segment: SegmentSpec,
+    pub timeout: Duration,
+    pub cancellation: CancellationToken,
+}
+
+#[derive(Clone, Debug)]
 pub struct SubtitleRequest {
     pub source: Url,
     pub headers: BTreeMap<String, String>,
@@ -144,6 +161,214 @@ pub fn generate_segment(request: &SegmentRequest) -> Result<SegmentArtifact> {
         "all compatible encoders failed: {}",
         failures.join("; ")
     )))
+}
+
+/// Generates the same audio interval for every rendition from one demux/decode
+/// pass. This keeps alternate tracks warm without reopening the remote source.
+///
+/// # Errors
+///
+/// Returns an error when stream selection, seeking, encoding, or CMAF output
+/// fails for any requested audio track.
+#[allow(clippy::too_many_lines)]
+pub fn generate_audio_bundle(request: &AudioBundleRequest) -> Result<Vec<SegmentArtifact>> {
+    if request.cancellation.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    let mut artifacts = Vec::with_capacity(request.tracks.len());
+    let mut missing = Vec::new();
+    for track in &request.tracks {
+        fs::create_dir_all(&track.output_dir)?;
+        let init_path = track.output_dir.join("init.mp4");
+        let segment_path = track.output_dir.join("segment.m4s");
+        if valid_cached_segment(&init_path, &segment_path) {
+            artifacts.push(SegmentArtifact {
+                init_path,
+                segment_path,
+                mode: PipelineMode::Transcode,
+                cached: true,
+            });
+        } else {
+            let _ = fs::remove_file(&init_path);
+            let _ = fs::remove_file(&segment_path);
+            missing.push(track.clone());
+        }
+    }
+    if missing.is_empty() {
+        return Ok(artifacts);
+    }
+
+    let encoder = encoder_candidates(TrackKind::Audio)
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            Error::MissingElement("AAC encoder producing browser-compatible output".to_owned())
+        })?;
+    let pipeline = gst::Pipeline::with_name("air-transcode-audio-bundle");
+    let _pipeline_cleanup = PipelineCleanup(pipeline.clone());
+    let desired_caps = gst::Caps::builder("audio/x-raw").build();
+    let source = gst::ElementFactory::make("uridecodebin3")
+        .name("audio-bundle-source")
+        .property("uri", request.source.as_str())
+        .property("caps", &desired_caps)
+        .build()
+        .map_err(|_| Error::MissingElement("uridecodebin3".to_owned()))?;
+    configure_source(&source, request.headers.clone(), request.timeout);
+    source.connect("select-stream", false, move |values| {
+        let stream = values
+            .get(2)
+            .and_then(|value| value.get::<gst::Stream>().ok())?;
+        Some(i32::from(stream.stream_type().contains(gst::StreamType::AUDIO)).to_value())
+    });
+    pipeline
+        .add(&source)
+        .map_err(|error| Error::Pipeline(error.to_string()))?;
+
+    let mut sinks = Vec::with_capacity(missing.len());
+    let mut branches = Vec::with_capacity(missing.len());
+    for track in &missing {
+        let queue = make("queue")?;
+        let chain = build_track_chain(
+            TrackKind::Audio,
+            PipelineMode::Transcode,
+            Some(&encoder.element),
+            None,
+            None,
+            false,
+        )?;
+        let sink = gst::ElementFactory::make("appsink")
+            .name(format!("audio-sink-{}", track.index))
+            .property("sync", false)
+            .property("max-buffers", 2048_u32)
+            .build()
+            .map_err(|_| Error::MissingElement("appsink".to_owned()))?
+            .downcast::<gst_app::AppSink>()
+            .map_err(|_| Error::Pipeline("audio appsink has an unexpected type".to_owned()))?;
+        let sink_element = sink.clone().upcast::<gst::Element>();
+        pipeline
+            .add(&queue)
+            .map_err(|error| Error::Pipeline(error.to_string()))?;
+        for element in &chain {
+            pipeline
+                .add(element)
+                .map_err(|error| Error::Pipeline(error.to_string()))?;
+        }
+        pipeline
+            .add(&sink_element)
+            .map_err(|error| Error::Pipeline(error.to_string()))?;
+        let mut elements: Vec<&gst::Element> = Vec::with_capacity(chain.len() + 2);
+        elements.push(&queue);
+        elements.extend(chain.iter());
+        elements.push(&sink_element);
+        gst::Element::link_many(&elements).map_err(|error| Error::Pipeline(error.to_string()))?;
+        let queue_sink = queue
+            .static_pad("sink")
+            .ok_or_else(|| Error::Pipeline("audio bundle queue has no sink pad".to_owned()))?;
+        branches.push((track.stream_id.clone(), queue_sink));
+        sinks.push((track.clone(), sink));
+    }
+    source.connect_pad_added(move |_, pad| {
+        let stream_id = pad.stream_id().map(|value| value.to_string());
+        if let Some((_, sink)) = branches.iter().find(|(wanted, sink)| {
+            !sink.is_linked()
+                && wanted.as_deref().is_none_or(|wanted| {
+                    stream_id.as_deref() == Some(wanted)
+                        || stream_id
+                            .as_deref()
+                            .is_some_and(|actual| actual.ends_with(wanted))
+                })
+        }) {
+            let _ = pad.link(sink);
+        }
+    });
+
+    pipeline
+        .set_state(gst::State::Paused)
+        .map_err(|error| Error::Pipeline(error.to_string()))?;
+    wait_for_state(
+        &pipeline,
+        gst::State::Paused,
+        request.timeout,
+        &request.cancellation,
+    )?;
+    let start = gst::ClockTime::from_nseconds(request.segment.start_ns);
+    let stop =
+        gst::ClockTime::from_nseconds(request.segment.start_ns + request.segment.duration_ns);
+    if request.segment.start_ns > 0
+        && pipeline
+            .seek(
+                1.0,
+                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                gst::SeekType::Set,
+                start,
+                gst::SeekType::Set,
+                stop,
+            )
+            .is_err()
+    {
+        return Err(Error::Pipeline(
+            "audio bundle source rejected seek".to_owned(),
+        ));
+    }
+    pipeline
+        .set_state(gst::State::Playing)
+        .map_err(|error| Error::Pipeline(error.to_string()))?;
+
+    for (track, sink) in sinks {
+        let encoded_track = collect_encoded_track(
+            &pipeline,
+            &sink,
+            request.segment.duration_ns,
+            request.timeout,
+            &request.cancellation,
+        )?;
+        let combined_path = track.output_dir.join("combined.mp4");
+        let segment_request = SegmentRequest {
+            source: request.source.clone(),
+            headers: request.headers.clone(),
+            track: TrackKind::Audio,
+            segment: request.segment.clone(),
+            mode: PipelineMode::Transcode,
+            output_dir: track.output_dir.clone(),
+            timeout: request.timeout,
+            cancellation: request.cancellation.clone(),
+            video_dimensions: None,
+            selected_stream_id: track.stream_id,
+            transmux_video_codec: None,
+            tone_map_hdr: false,
+        };
+        mux_encoded_track(&segment_request, encoded_track, &combined_path)?;
+        let combined = fs::read(&combined_path)?;
+        let (init, media) = split_cmaf(&combined)?;
+        let init_path = track.output_dir.join("init.mp4");
+        let segment_path = track.output_dir.join("segment.m4s");
+        fs::write(&init_path, init)?;
+        fs::write(&segment_path, media)?;
+        let _ = fs::remove_file(combined_path);
+        validate_init_segment(&fs::read(&init_path)?)?;
+        validate_media_segment(&fs::read(&segment_path)?)?;
+        artifacts.push(SegmentArtifact {
+            init_path,
+            segment_path,
+            mode: PipelineMode::Transcode,
+            cached: false,
+        });
+    }
+    let _ = pipeline.set_state(gst::State::Null);
+    Ok(artifacts)
+}
+
+fn valid_cached_segment(init_path: &Path, segment_path: &Path) -> bool {
+    init_path.is_file()
+        && segment_path.is_file()
+        && fs::read(init_path)
+            .ok()
+            .and_then(|data| validate_init_segment(&data).ok())
+            .is_some()
+        && fs::read(segment_path)
+            .ok()
+            .and_then(|data| validate_media_segment(&data).ok())
+            .is_some()
 }
 
 /// Extracts one selected text subtitle interval as a standalone `WebVTT` segment.
@@ -1049,7 +1274,7 @@ fn configure_source(source: &gst::Element, headers: BTreeMap<String, String>, ti
             child.set_property("timeout", timeout_seconds);
         }
         if child.find_property("retries").is_some() {
-            child.set_property("retries", 1_i32);
+            child.set_property("retries", 0_i32);
         }
         if child.find_property("compress").is_some() {
             child.set_property("compress", false);

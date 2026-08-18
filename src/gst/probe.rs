@@ -136,7 +136,7 @@ fn configure_http_source(source: &gst::Element, timeout_seconds: u32) {
         source.set_property("timeout", timeout_seconds);
     }
     if source.find_property("retries").is_some() {
-        source.set_property("retries", 1_i32);
+        source.set_property("retries", 0_i32);
     }
     if source.find_property("compress").is_some() {
         source.set_property("compress", false);

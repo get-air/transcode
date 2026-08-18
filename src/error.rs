@@ -28,6 +28,12 @@ pub enum Error {
     #[error("session {0} was not found")]
     SessionNotFound(uuid::Uuid),
 
+    #[error("source {0} was not found")]
+    SourceNotFound(uuid::Uuid),
+
+    #[error("source is rate limited")]
+    SourceRateLimited { retry_after_seconds: Option<u64> },
+
     #[error("track {0} was not found")]
     TrackNotFound(String),
 
@@ -68,19 +74,28 @@ struct ErrorBody<'a> {
 struct ErrorPayload<'a> {
     code: &'a str,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after_seconds: Option<u64>,
 }
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
+        let retry_after_seconds = match &self {
+            Self::SourceRateLimited {
+                retry_after_seconds,
+            } => *retry_after_seconds,
+            _ => None,
+        };
         let (status, code) = match self {
             Self::InvalidSource(_)
             | Self::InvalidOutput(_)
             | Self::UnknownDuration
             | Self::SegmentOutOfRange { .. } => (StatusCode::BAD_REQUEST, "invalid_request"),
             Self::Cancelled => (StatusCode::REQUEST_TIMEOUT, "cancelled"),
-            Self::SessionNotFound(_) | Self::TrackNotFound(_) => {
+            Self::SessionNotFound(_) | Self::SourceNotFound(_) | Self::TrackNotFound(_) => {
                 (StatusCode::NOT_FOUND, "not_found")
             }
+            Self::SourceRateLimited { .. } => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
             Self::MissingElement(_) => (StatusCode::SERVICE_UNAVAILABLE, "missing_runtime"),
             Self::Discovery(_) | Self::Pipeline(_) | Self::MisalignedKeyframe { .. } => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "media_processing_failed")
@@ -93,6 +108,7 @@ impl IntoResponse for Error {
             error: ErrorPayload {
                 code,
                 message: self.to_string(),
+                retry_after_seconds,
             },
         };
         (status, Json(body)).into_response()
