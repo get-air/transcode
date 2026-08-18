@@ -267,10 +267,15 @@ fn video_track(
         name,
         codec,
         video_codec,
-        rfc6381_codec: structure.and_then(|structure| {
-            h264_codec(structure)
-                .or_else(|| video_codec.map(|codec| codec.rfc6381_fallback().to_owned()))
-        }),
+        rfc6381_codec: caps
+            .and_then(|caps| gst_pbutils::codec_utils_caps_get_mime_codec(caps).ok())
+            .map(|codec| codec.to_string())
+            .or_else(|| {
+                structure.and_then(|structure| {
+                    h264_codec(structure)
+                        .or_else(|| video_codec.map(|codec| codec.rfc6381_fallback().to_owned()))
+                })
+            }),
         caps: caps_string,
         bit_depth,
         colorimetry: structure

@@ -807,9 +807,12 @@ async fn declared_modern_video_codecs_are_transmuxed_without_reencoding() -> Tes
         .await?;
         assert_eq!(session["tracks"][0]["video_codec"], codec);
         assert_eq!(session["renditions"][0]["mode"], "transmux");
-        assert_eq!(
-            session["renditions"][0]["output_codec"],
-            if codec == "h265" { "hvc1" } else { "av01" }
+        let output_codec = session["renditions"][0]["output_codec"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("missing video codec string"))?;
+        assert!(
+            output_codec.starts_with(if codec == "h265" { "hvc1." } else { "av01." }),
+            "expected a precise RFC 6381 codec, received {output_codec}"
         );
         let id = json_string(&session, "id")?;
         let init = fetch_bytes(
