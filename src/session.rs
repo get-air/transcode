@@ -167,6 +167,7 @@ pub struct Session {
     external_subtitles: HashMap<usize, ExternalSubtitle>,
     segment_locks: DashMap<(TrackKind, usize, u32), Arc<tokio::sync::Mutex<()>>>,
     subtitle_locks: DashMap<(usize, u32), Arc<tokio::sync::Mutex<()>>>,
+    cache_prune_lock: Mutex<()>,
     cancellation: CancellationToken,
     adaptive_max_height: AtomicU32,
     touched: Mutex<Instant>,
@@ -653,6 +654,7 @@ impl SessionManager {
             external_subtitles,
             segment_locks: DashMap::new(),
             subtitle_locks: DashMap::new(),
+            cache_prune_lock: Mutex::new(()),
             cancellation: self.cancellation.child_token(),
             adaptive_max_height: AtomicU32::new(initial_max_height),
             touched: Mutex::new(Instant::now()),
@@ -1120,6 +1122,7 @@ impl SessionManager {
     }
 
     fn prune_session_cache(&self, session: &Session) -> Result<()> {
+        let _prune_guard = session.cache_prune_lock.lock();
         let limit = self.config.max_cached_segments.max(1);
         for kind in ["video", "audio", "subtitles"] {
             let kind_dir = session.directory.join(kind);
