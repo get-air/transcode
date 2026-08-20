@@ -868,7 +868,6 @@ impl SessionManager {
                     PipelineMode::Transcode => &self.metrics.transcode_segments,
                 }
                 .fetch_add(1, Ordering::Relaxed);
-                self.prune_session_cache(&session)?;
             }
             Err(Error::Cancelled) => {
                 self.metrics
@@ -932,6 +931,7 @@ impl SessionManager {
                 });
             futures_util::future::try_join_all(jobs).await?;
         }
+        self.prune_session_cache(&session)?;
         Ok(sequences)
     }
 
@@ -1027,7 +1027,6 @@ impl SessionManager {
                 self.metrics
                     .subtitle_segments
                     .fetch_add(1, Ordering::Relaxed);
-                self.prune_session_cache(&session)?;
             }
             Err(Error::Cancelled) => {
                 self.metrics
@@ -1121,7 +1120,7 @@ impl SessionManager {
         }
     }
 
-    fn prune_session_cache(&self, session: &Session) -> Result<()> {
+    pub(crate) fn prune_session_cache(&self, session: &Session) -> Result<()> {
         let _prune_guard = session.cache_prune_lock.lock();
         let limit = self.config.max_cached_segments.max(1);
         for kind in ["video", "audio", "subtitles"] {
