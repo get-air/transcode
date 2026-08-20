@@ -167,6 +167,7 @@ pub struct Session {
     external_subtitles: HashMap<usize, ExternalSubtitle>,
     segment_locks: DashMap<(TrackKind, usize, u32), Arc<tokio::sync::Mutex<()>>>,
     subtitle_locks: DashMap<(usize, u32), Arc<tokio::sync::Mutex<()>>>,
+    cache_prune_lock: Mutex<()>,
     cancellation: CancellationToken,
     adaptive_max_height: AtomicU32,
     touched: Mutex<Instant>,
@@ -653,6 +654,7 @@ impl SessionManager {
             external_subtitles,
             segment_locks: DashMap::new(),
             subtitle_locks: DashMap::new(),
+            cache_prune_lock: Mutex::new(()),
             cancellation: self.cancellation.child_token(),
             adaptive_max_height: AtomicU32::new(initial_max_height),
             touched: Mutex::new(Instant::now()),
@@ -866,7 +868,6 @@ impl SessionManager {
                     PipelineMode::Transcode => &self.metrics.transcode_segments,
                 }
                 .fetch_add(1, Ordering::Relaxed);
-                self.prune_session_cache(&session)?;
             }
             Err(Error::Cancelled) => {
                 self.metrics
@@ -930,6 +931,7 @@ impl SessionManager {
                 });
             futures_util::future::try_join_all(jobs).await?;
         }
+        self.prune_session_cache(&session)?;
         Ok(sequences)
     }
 
@@ -1025,7 +1027,6 @@ impl SessionManager {
                 self.metrics
                     .subtitle_segments
                     .fetch_add(1, Ordering::Relaxed);
-                self.prune_session_cache(&session)?;
             }
             Err(Error::Cancelled) => {
                 self.metrics
@@ -1119,7 +1120,8 @@ impl SessionManager {
         }
     }
 
-    fn prune_session_cache(&self, session: &Session) -> Result<()> {
+    pub(crate) fn prune_session_cache(&self, session: &Session) -> Result<()> {
+        let _prune_guard = session.cache_prune_lock.lock();
         let limit = self.config.max_cached_segments.max(1);
         for kind in ["video", "audio", "subtitles"] {
             let kind_dir = session.directory.join(kind);
@@ -1140,7 +1142,7 @@ impl SessionManager {
                         }
                     })
                     .filter_map(|entry| {
-                        let modified = entry.metadata().ok()?.modified().ok()?;
+                        let modified = cache_entry_modified(&entry.path())?;
                         Some((modified, entry.path()))
                     })
                     .collect::<Vec<_>>();
@@ -1149,7 +1151,14 @@ impl SessionManager {
                 }
                 entries.sort_by_key(|(modified, _)| *modified);
                 let remove_count = entries.len() - limit;
-                for (_, path) in entries.into_iter().take(remove_count) {
+                let recent_cutoff = std::time::SystemTime::now()
+                    .checked_sub(Duration::from_secs(2))
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                for (_, path) in entries
+                    .into_iter()
+                    .filter(|(modified, _)| *modified < recent_cutoff)
+                    .take(remove_count)
+                {
                     if path.is_dir() {
                         std::fs::remove_dir_all(path)?;
                     } else {
@@ -1180,15 +1189,33 @@ fn enforce_cache_byte_budget(root: &std::path::Path, limit: u64) -> Result<()> {
         return Ok(());
     }
     files.sort_by_key(|(modified, _, _)| *modified);
-    for (_, size, path) in files {
+    let recent_cutoff = std::time::SystemTime::now()
+        .checked_sub(Duration::from_secs(2))
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    for (modified, size, path) in files {
         if total <= limit {
             break;
+        }
+        if modified >= recent_cutoff {
+            continue;
         }
         if std::fs::remove_file(path).is_ok() {
             total = total.saturating_sub(size);
         }
     }
     Ok(())
+}
+
+fn cache_entry_modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    if path.is_file() {
+        return path.metadata().ok()?.modified().ok();
+    }
+    std::fs::read_dir(path)
+        .ok()?
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| entry.metadata().ok()?.modified().ok())
+        .max()
+        .or_else(|| path.metadata().ok()?.modified().ok())
 }
 
 fn collect_cache_files(

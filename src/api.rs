@@ -410,8 +410,11 @@ async fn init(
 ) -> Result<Response> {
     let track = parse_track(&track)?;
     let session = state.sessions.get(id)?;
-    let artifact = state.sessions.segment(session, track, 1).await?;
-    file_response(&artifact.init_path, "video/mp4").await
+    let artifact = state
+        .sessions
+        .segment(Arc::clone(&session), track, 1)
+        .await?;
+    artifact_response(&state, &session, &artifact.init_path, "video/mp4").await
 }
 
 async fn segment(
@@ -420,8 +423,17 @@ async fn segment(
 ) -> Result<Response> {
     let track = parse_track(&track)?;
     let session = state.sessions.get(id)?;
-    let artifact = state.sessions.segment(session, track, sequence).await?;
-    file_response(&artifact.segment_path, "video/iso.segment").await
+    let artifact = state
+        .sessions
+        .segment(Arc::clone(&session), track, sequence)
+        .await?;
+    artifact_response(
+        &state,
+        &session,
+        &artifact.segment_path,
+        "video/iso.segment",
+    )
+    .await
 }
 
 async fn segment_init(
@@ -430,8 +442,11 @@ async fn segment_init(
 ) -> Result<Response> {
     let track = parse_track(&track)?;
     let session = state.sessions.get(id)?;
-    let artifact = state.sessions.segment(session, track, sequence).await?;
-    file_response(&artifact.init_path, "video/mp4").await
+    let artifact = state
+        .sessions
+        .segment(Arc::clone(&session), track, sequence)
+        .await?;
+    artifact_response(&state, &session, &artifact.init_path, "video/mp4").await
 }
 
 async fn indexed_audio_init(
@@ -441,9 +456,9 @@ async fn indexed_audio_init(
     let session = state.sessions.get(id)?;
     let artifact = state
         .sessions
-        .segment_for(session, TrackKind::Audio, track_index, 1)
+        .segment_for(Arc::clone(&session), TrackKind::Audio, track_index, 1)
         .await?;
-    file_response(&artifact.init_path, "video/mp4").await
+    artifact_response(&state, &session, &artifact.init_path, "video/mp4").await
 }
 
 async fn indexed_audio_segment(
@@ -453,9 +468,20 @@ async fn indexed_audio_segment(
     let session = state.sessions.get(id)?;
     let artifact = state
         .sessions
-        .segment_for(session, TrackKind::Audio, track_index, sequence)
+        .segment_for(
+            Arc::clone(&session),
+            TrackKind::Audio,
+            track_index,
+            sequence,
+        )
         .await?;
-    file_response(&artifact.segment_path, "video/iso.segment").await
+    artifact_response(
+        &state,
+        &session,
+        &artifact.segment_path,
+        "video/iso.segment",
+    )
+    .await
 }
 
 async fn indexed_audio_segment_init(
@@ -465,9 +491,14 @@ async fn indexed_audio_segment_init(
     let session = state.sessions.get(id)?;
     let artifact = state
         .sessions
-        .segment_for(session, TrackKind::Audio, track_index, sequence)
+        .segment_for(
+            Arc::clone(&session),
+            TrackKind::Audio,
+            track_index,
+            sequence,
+        )
         .await?;
-    file_response(&artifact.init_path, "video/mp4").await
+    artifact_response(&state, &session, &artifact.init_path, "video/mp4").await
 }
 
 async fn indexed_subtitle_segment(
@@ -477,9 +508,9 @@ async fn indexed_subtitle_segment(
     let session = state.sessions.get(id)?;
     let artifact = state
         .sessions
-        .subtitle_segment(session, track_index, sequence)
+        .subtitle_segment(Arc::clone(&session), track_index, sequence)
         .await?;
-    file_response(&artifact.path, "text/vtt; charset=utf-8").await
+    artifact_response(&state, &session, &artifact.path, "text/vtt; charset=utf-8").await
 }
 
 fn parse_track(track: &str) -> Result<TrackKind> {
@@ -513,5 +544,16 @@ async fn file_response(path: &std::path::Path, content_type: &'static str) -> Re
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, max-age=31536000, immutable"),
     );
+    Ok(response)
+}
+
+async fn artifact_response(
+    state: &AppState,
+    session: &crate::session::Session,
+    path: &std::path::Path,
+    content_type: &'static str,
+) -> Result<Response> {
+    let response = file_response(path, content_type).await?;
+    state.sessions.prune_session_cache(session)?;
     Ok(response)
 }

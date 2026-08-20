@@ -442,6 +442,8 @@ fn generate_segment_once(
                 .and_then(|data| validate_media_segment(&data).ok())
                 .is_some();
         if valid {
+            touch_cache_file(&init_path);
+            touch_cache_file(&segment_path);
             return Ok(SegmentArtifact {
                 init_path,
                 segment_path,
@@ -645,6 +647,12 @@ fn generate_segment_once(
         cached: false,
         processing_time_ns,
     })
+}
+
+fn touch_cache_file(path: &Path) {
+    if let Ok(file) = fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
 }
 
 fn validate_transmux_keyframe(request: &SegmentRequest, encoded: &EncodedTrack) -> Result<()> {
