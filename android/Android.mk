@@ -6,7 +6,7 @@ endif
 
 GSTREAMER_PLUGINS := \
   coreelements app audioconvert audioresample autodetect typefindfunctions \
-  videoconvertscale playback uriplaylistbin \
+  videoconvertscale videorate playback uriplaylistbin \
   subparse ogg vorbis opus audioparsers avi flac flv id3demux isomp4 jpeg \
   matroska mpg123 multipart png speex vpx wavparse openh264 opusparse \
   videoparsersbad openjpeg spandsp sbc androidmedia dav1d ffv1 isobmff \

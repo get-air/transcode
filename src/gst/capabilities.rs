@@ -31,7 +31,7 @@ pub struct Capabilities {
 #[serde(rename_all = "snake_case")]
 pub enum HdrToneMapping {
     Va,
-    Basic,
+    Software,
     Unavailable,
 }
 
@@ -50,11 +50,8 @@ pub fn hdr_tone_mapping() -> HdrToneMapping {
         .is_some_and(|element| element.find_property("hdr-tone-mapping").is_some());
     if va_encoder && va_postprocess {
         HdrToneMapping::Va
-    } else if available("videoconvert")
-        && available("videoscale")
-        && !encoder_candidates(TrackKind::Video).is_empty()
-    {
-        HdrToneMapping::Basic
+    } else if available("hdrtonemap") {
+        HdrToneMapping::Software
     } else {
         HdrToneMapping::Unavailable
     }
@@ -89,9 +86,9 @@ pub fn encoder_candidates(track: TrackKind) -> Vec<EncoderCandidate> {
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
-        right
-            .hardware
-            .cmp(&left.hardware)
+        platform_preference(&left.element)
+            .cmp(&platform_preference(&right.element))
+            .then_with(|| right.hardware.cmp(&left.hardware))
             .then_with(|| right.rank.cmp(&left.rank))
             .then_with(|| {
                 software_preference(&left.element).cmp(&software_preference(&right.element))
@@ -99,6 +96,20 @@ pub fn encoder_candidates(track: TrackKind) -> Vec<EncoderCandidate> {
             .then_with(|| left.element.cmp(&right.element))
     });
     candidates
+}
+
+fn platform_preference(name: &str) -> u8 {
+    if name.starts_with("amc") {
+        0
+    } else if name.starts_with("nv")
+        || name.starts_with("va")
+        || name.starts_with("qsv")
+        || name.starts_with("v4l2")
+    {
+        1
+    } else {
+        2
+    }
 }
 
 fn software_preference(name: &str) -> u8 {

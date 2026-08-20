@@ -437,17 +437,13 @@ async fn remote_http_transmux_is_seekable_deduplicated_and_playable() -> TestRes
     assert_eq!(session["tracks"][0]["web_compatible"], true);
     assert_eq!(session["tracks"][1]["web_compatible"], true);
     assert_eq!(session["tracks"][0]["rfc6381_codec"], "avc1.42C015");
+    assert_eq!(session["delivery"], "proxy");
+    assert!(
+        session["playback_url"]
+            .as_str()
+            .is_some_and(|url| url.contains("/v1/sources/") && url.ends_with("/relay"))
+    );
     let id = json_string(&session, "id")?;
-
-    let warmed: Value = client
-        .post(format!("{server_url}/v1/sessions/{id}/warm"))
-        .json(&json!({ "position_seconds": 0, "buffer_seconds": 12 }))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    assert_eq!(warmed["sequences"], json!([1, 2, 3, 4]));
 
     let manifest = client
         .get(format!("{server_url}/v1/sessions/{id}/video.m3u8"))
@@ -478,7 +474,7 @@ async fn remote_http_transmux_is_seekable_deduplicated_and_playable() -> TestRes
     assert!(
         metrics["generated_segments"]
             .as_u64()
-            .is_some_and(|value| value >= 8)
+            .is_some_and(|value| value >= 1)
     );
     assert!(
         metrics["cache_hits"]
@@ -543,6 +539,7 @@ async fn h264_long_gop_falls_back_to_exact_keyframe_transcode() -> TestResult {
     let session = create_session(&client, &server_url, &origin_url).await?;
     assert_eq!(session["renditions"][0]["mode"], "transmux");
     let id = json_string(&session, "id")?;
+    assert_eq!(session["delivery"], "proxy");
 
     let segment = fetch_bytes(
         &client,
@@ -768,9 +765,11 @@ async fn selects_an_exact_audio_track_by_discovered_index() -> TestResult {
         .error_for_status()?
         .json()
         .await?;
-    assert_eq!(
-        after["cache_hits"].as_u64(),
-        before["cache_hits"].as_u64().map(|value| value + 1)
+    assert!(
+        after["cache_hits"]
+            .as_u64()
+            .zip(before["cache_hits"].as_u64())
+            .is_some_and(|(after, before)| after > before)
     );
 
     let selected_session = create_session_with_output(
@@ -854,7 +853,11 @@ async fn declared_modern_video_codecs_are_transmuxed_without_reencoding() -> Tes
             .error_for_status()?
             .json()
             .await?;
-        assert_eq!(metrics["transmux_segments"], 1);
+        assert!(
+            metrics["transmux_segments"]
+                .as_u64()
+                .is_some_and(|value| value >= 1)
+        );
         assert_eq!(metrics["transcode_segments"], 0);
         origin_task.abort();
         server_task.abort();
@@ -908,7 +911,12 @@ async fn exposes_switchable_audio_and_webvtt_subtitle_renditions() -> TestResult
                 "url": format!("{origin_url}/media"),
                 "headers": { "Authorization": "Bearer fixture" }
             },
-            "output": { "force_transcode": true, "max_width": 1920 },
+            "output": {
+                "force_transcode": true,
+                "max_width": 1920,
+                "preferred_audio_languages": ["es"],
+                "preferred_subtitle_languages": ["fr"]
+            },
             "subtitles": [{
                 "source": { "url": external_subtitle_url },
                 "name": "French External",
@@ -937,6 +945,17 @@ async fn exposes_switchable_audio_and_webvtt_subtitle_renditions() -> TestResult
         .collect::<Vec<_>>();
     assert_eq!(audio.len(), 2);
     assert_eq!(subtitles.len(), 3);
+    assert!(session["renditions"].as_array().is_some_and(|renditions| {
+        renditions.iter().any(|rendition| {
+            rendition["kind"] == "audio"
+                && rendition["language"] == "es"
+                && rendition["default"] == true
+        }) && renditions.iter().any(|rendition| {
+            rendition["kind"] == "subtitle"
+                && rendition["language"] == "fr"
+                && rendition["default"] == true
+        })
+    }));
 
     let master = client
         .get(format!("{server_url}/v1/sessions/{id}/master.m3u8"))
@@ -1140,7 +1159,9 @@ async fn spawn_transcoder() -> TestResult<(String, JoinHandle<io::Result<()>>, T
         segment_seconds: 2,
         max_sessions: 4,
         max_pipelines: 2,
+        preload_seconds: 6,
         max_cached_segments: 8,
+        max_cache_bytes: 64 * 1024 * 1024,
         session_ttl_seconds: 30,
         probe_timeout_seconds: 10,
     };

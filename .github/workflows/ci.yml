@@ -18,7 +18,7 @@ jobs:
       - name: Install system dependencies
         run: >-
           pacman -Syu --noconfirm --needed
-          git rustup pkgconf clang ripgrep
+          git rustup pkgconf clang ripgrep cargo-audit
           gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad
           gst-plugins-ugly gst-libav
           gst-plugin-isobmff
@@ -36,6 +36,14 @@ jobs:
 
       - name: Lint
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Check minimum supported Rust
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal
+          cargo +1.92.0 check --all-targets --locked
+
+      - name: Audit Rust dependencies
+        run: cargo audit --deny warnings
 
       - name: Test all targets
         run: cargo test --all-targets --locked

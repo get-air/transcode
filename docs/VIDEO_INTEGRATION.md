@@ -3,7 +3,8 @@
 The first integration should be a new HLS/CMAF backend in `@get-air/video`, not GStreamer code inside the browser package.
 
 1. Register the original source with `air-transcode` through the native application or trusted server boundary.
-2. Give the video controller only the opaque `master_url`.
+2. Give the video controller the opaque `playback_url`; compatible MP4 is
+   relayed directly and other inputs use the returned HLS master.
 3. Use native HLS where reliable and hls.js/MSE elsewhere.
 4. Read duration and tracks from the session response immediately rather than waiting for HTML media metadata.
 5. Map remote-control keys in the existing controller layer; native HTML controls are not a transcoder responsibility.

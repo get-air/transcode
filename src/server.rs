@@ -128,6 +128,7 @@ pub async fn spawn_server(config: Config) -> Result<EmbeddedServer> {
     if !state.capabilities.cmaf {
         return Err(Error::MissingElement("cmafmux".to_owned()));
     }
+    validate_browser_output_runtime(&state)?;
     let listener = TcpListener::bind(config.bind).await?;
     spawn_listener(listener, app(state))
 }
@@ -148,6 +149,7 @@ pub async fn spawn_tauri_host(config: Config, media_bind: SocketAddr) -> Result<
     if !state.capabilities.cmaf {
         return Err(Error::MissingElement("cmafmux".to_owned()));
     }
+    validate_browser_output_runtime(&state)?;
     let admin_listener = TcpListener::bind(config.bind).await?;
     let media_listener = TcpListener::bind(media_bind).await?;
     let admin_token = Uuid::new_v4().simple().to_string();
@@ -208,4 +210,21 @@ fn spawn_listener(listener: TcpListener, router: Router) -> Result<EmbeddedServe
         shutdown,
         task: Some(task),
     })
+}
+
+fn validate_browser_output_runtime(state: &AppState) -> Result<()> {
+    if !state.capabilities.http {
+        return Err(Error::MissingElement("HTTP source".to_owned()));
+    }
+    if state.capabilities.h264_encoders.is_empty() {
+        return Err(Error::MissingElement(
+            "H.264 encoder producing browser-compatible output".to_owned(),
+        ));
+    }
+    if state.capabilities.aac_encoders.is_empty() {
+        return Err(Error::MissingElement(
+            "AAC encoder producing browser-compatible output".to_owned(),
+        ));
+    }
+    Ok(())
 }

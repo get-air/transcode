@@ -61,6 +61,8 @@ pub struct MediaTrack {
     pub language: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    pub frame_rate_num: Option<u32>,
+    pub frame_rate_denom: Option<u32>,
     pub channels: Option<u32>,
     pub sample_rate: Option<u32>,
     pub web_compatible: bool,
@@ -234,6 +236,7 @@ fn video_track(
     name: Option<String>,
 ) -> MediaTrack {
     let structure = caps.and_then(|caps| caps.structure(0));
+    let frame_rate = video.framerate();
     let video_codec = structure.and_then(|structure| match structure.name().as_str() {
         "video/x-h264" => Some(VideoCodec::H264),
         "video/x-h265" => Some(VideoCodec::H265),
@@ -285,6 +288,8 @@ fn video_track(
         language,
         width: Some(video.width()),
         height: Some(video.height()),
+        frame_rate_num: u32::try_from(frame_rate.numer()).ok(),
+        frame_rate_denom: u32::try_from(frame_rate.denom()).ok(),
         channels: None,
         sample_rate: None,
         web_compatible,
@@ -324,6 +329,8 @@ fn audio_track(
         language,
         width: None,
         height: None,
+        frame_rate_num: None,
+        frame_rate_denom: None,
         channels: Some(audio.channels()),
         sample_rate: Some(audio.sample_rate()),
         web_compatible,
@@ -367,6 +374,8 @@ fn subtitle_track(
         language: language.or_else(|| subtitle.language().map(|value| value.to_string())),
         width: None,
         height: None,
+        frame_rate_num: None,
+        frame_rate_denom: None,
         channels: None,
         sample_rate: None,
         web_compatible,

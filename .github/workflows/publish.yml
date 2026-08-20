@@ -1,0 +1,45 @@
+name: Publish crate to crates.io
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    if: >-
+      github.repository == 'get-air/transcode' &&
+      github.event.release.prerelease == false &&
+      vars.CRATES_IO_TRUSTED_PUBLISHING == 'enabled'
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    timeout-minutes: 35
+    steps:
+      - name: Install system dependencies
+        run: >-
+          pacman -Syu --noconfirm --needed
+          git rustup pkgconf clang jq
+          gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad
+          gst-plugins-ugly gst-libav gst-plugin-isobmff
+      - uses: actions/checkout@v6
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.1 --profile minimal --component rustfmt,clippy
+      - name: Verify release tag and changelog
+        run: |
+          crate_version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')
+          test "$GITHUB_REF_NAME" = "v$crate_version"
+          case "$crate_version" in *-*) exit 1 ;; esac
+          test "$(grep -Fx "## $crate_version" CHANGELOG.md | wc -l)" = 1
+      - run: ./scripts/check-runtime.sh
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-targets --all-features
+      - run: cargo publish --dry-run --locked
+      - id: crates_io_auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates_io_auth.outputs.token }}

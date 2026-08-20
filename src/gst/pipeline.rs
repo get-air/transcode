@@ -44,6 +44,7 @@ pub struct SegmentRequest {
     pub timeout: Duration,
     pub cancellation: CancellationToken,
     pub video_dimensions: Option<(u32, u32)>,
+    pub video_max_fps: Option<u32>,
     pub selected_stream_id: Option<String>,
     pub transmux_video_codec: Option<VideoCodec>,
     pub tone_map_hdr: bool,
@@ -55,23 +56,7 @@ pub struct SegmentArtifact {
     pub segment_path: PathBuf,
     pub mode: PipelineMode,
     pub cached: bool,
-}
-
-#[derive(Clone, Debug)]
-pub struct AudioBundleTrack {
-    pub index: usize,
-    pub stream_id: Option<String>,
-    pub output_dir: PathBuf,
-}
-
-#[derive(Clone, Debug)]
-pub struct AudioBundleRequest {
-    pub source: Url,
-    pub headers: BTreeMap<String, String>,
-    pub tracks: Vec<AudioBundleTrack>,
-    pub segment: SegmentSpec,
-    pub timeout: Duration,
-    pub cancellation: CancellationToken,
+    pub processing_time_ns: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -136,7 +121,8 @@ pub fn generate_segment(request: &SegmentRequest) -> Result<SegmentArtifact> {
     let mut failures = Vec::new();
     let mut first_attempt = true;
     let deadline = std::time::Instant::now() + request.timeout;
-    for candidate in candidates {
+    let candidate_count = candidates.len();
+    for (index, candidate) in candidates.into_iter().enumerate() {
         if request.cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
@@ -150,7 +136,11 @@ pub fn generate_segment(request: &SegmentRequest) -> Result<SegmentArtifact> {
             break;
         }
         let mut attempt = request.clone();
-        attempt.timeout = remaining;
+        attempt.timeout = if index + 1 == candidate_count {
+            remaining
+        } else {
+            remaining.min(Duration::from_secs(3))
+        };
         match generate_segment_once(&attempt, Some(&candidate.element)) {
             Ok(artifact) => return Ok(artifact),
             Err(error) => failures.push(format!("{}: {error}", candidate.element)),
@@ -160,214 +150,6 @@ pub fn generate_segment(request: &SegmentRequest) -> Result<SegmentArtifact> {
         "all compatible encoders failed: {}",
         failures.join("; ")
     )))
-}
-
-/// Generates the same audio interval for every rendition from one demux/decode
-/// pass. This keeps alternate tracks warm without reopening the remote source.
-///
-/// # Errors
-///
-/// Returns an error when stream selection, seeking, encoding, or CMAF output
-/// fails for any requested audio track.
-#[allow(clippy::too_many_lines)]
-pub fn generate_audio_bundle(request: &AudioBundleRequest) -> Result<Vec<SegmentArtifact>> {
-    if request.cancellation.is_cancelled() {
-        return Err(Error::Cancelled);
-    }
-    let mut artifacts = Vec::with_capacity(request.tracks.len());
-    let mut missing = Vec::new();
-    for track in &request.tracks {
-        fs::create_dir_all(&track.output_dir)?;
-        let init_path = track.output_dir.join("init.mp4");
-        let segment_path = track.output_dir.join("segment.m4s");
-        if valid_cached_segment(&init_path, &segment_path) {
-            artifacts.push(SegmentArtifact {
-                init_path,
-                segment_path,
-                mode: PipelineMode::Transcode,
-                cached: true,
-            });
-        } else {
-            let _ = fs::remove_file(&init_path);
-            let _ = fs::remove_file(&segment_path);
-            missing.push(track.clone());
-        }
-    }
-    if missing.is_empty() {
-        return Ok(artifacts);
-    }
-
-    let encoder = encoder_candidates(TrackKind::Audio)
-        .into_iter()
-        .next()
-        .ok_or_else(|| {
-            Error::MissingElement("AAC encoder producing browser-compatible output".to_owned())
-        })?;
-    let pipeline = gst::Pipeline::with_name("air-transcode-audio-bundle");
-    let _pipeline_cleanup = PipelineCleanup(pipeline.clone());
-    let desired_caps = gst::Caps::builder("audio/x-raw").build();
-    let source = gst::ElementFactory::make("uridecodebin3")
-        .name("audio-bundle-source")
-        .property("uri", request.source.as_str())
-        .property("caps", &desired_caps)
-        .build()
-        .map_err(|_| Error::MissingElement("uridecodebin3".to_owned()))?;
-    configure_source(&source, request.headers.clone(), request.timeout);
-    source.connect("select-stream", false, move |values| {
-        let stream = values
-            .get(2)
-            .and_then(|value| value.get::<gst::Stream>().ok())?;
-        Some(i32::from(stream.stream_type().contains(gst::StreamType::AUDIO)).to_value())
-    });
-    pipeline
-        .add(&source)
-        .map_err(|error| Error::Pipeline(error.to_string()))?;
-
-    let mut sinks = Vec::with_capacity(missing.len());
-    let mut branches = Vec::with_capacity(missing.len());
-    for track in &missing {
-        let queue = make("queue")?;
-        let chain = build_track_chain(
-            TrackKind::Audio,
-            PipelineMode::Transcode,
-            Some(&encoder.element),
-            None,
-            None,
-            false,
-        )?;
-        let sink = gst::ElementFactory::make("appsink")
-            .name(format!("audio-sink-{}", track.index))
-            .property("sync", false)
-            .property("max-buffers", 2048_u32)
-            .build()
-            .map_err(|_| Error::MissingElement("appsink".to_owned()))?
-            .downcast::<gst_app::AppSink>()
-            .map_err(|_| Error::Pipeline("audio appsink has an unexpected type".to_owned()))?;
-        let sink_element = sink.clone().upcast::<gst::Element>();
-        pipeline
-            .add(&queue)
-            .map_err(|error| Error::Pipeline(error.to_string()))?;
-        for element in &chain {
-            pipeline
-                .add(element)
-                .map_err(|error| Error::Pipeline(error.to_string()))?;
-        }
-        pipeline
-            .add(&sink_element)
-            .map_err(|error| Error::Pipeline(error.to_string()))?;
-        let mut elements: Vec<&gst::Element> = Vec::with_capacity(chain.len() + 2);
-        elements.push(&queue);
-        elements.extend(chain.iter());
-        elements.push(&sink_element);
-        gst::Element::link_many(&elements).map_err(|error| Error::Pipeline(error.to_string()))?;
-        let queue_sink = queue
-            .static_pad("sink")
-            .ok_or_else(|| Error::Pipeline("audio bundle queue has no sink pad".to_owned()))?;
-        branches.push((track.stream_id.clone(), queue_sink));
-        sinks.push((track.clone(), sink));
-    }
-    source.connect_pad_added(move |_, pad| {
-        let stream_id = pad.stream_id().map(|value| value.to_string());
-        if let Some((_, sink)) = branches.iter().find(|(wanted, sink)| {
-            !sink.is_linked()
-                && wanted.as_deref().is_none_or(|wanted| {
-                    stream_id.as_deref() == Some(wanted)
-                        || stream_id
-                            .as_deref()
-                            .is_some_and(|actual| actual.ends_with(wanted))
-                })
-        }) {
-            let _ = pad.link(sink);
-        }
-    });
-
-    pipeline
-        .set_state(gst::State::Paused)
-        .map_err(|error| Error::Pipeline(error.to_string()))?;
-    wait_for_state(
-        &pipeline,
-        gst::State::Paused,
-        request.timeout,
-        &request.cancellation,
-    )?;
-    let start = gst::ClockTime::from_nseconds(request.segment.start_ns);
-    let stop =
-        gst::ClockTime::from_nseconds(request.segment.start_ns + request.segment.duration_ns);
-    if request.segment.start_ns > 0
-        && pipeline
-            .seek(
-                1.0,
-                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
-                gst::SeekType::Set,
-                start,
-                gst::SeekType::Set,
-                stop,
-            )
-            .is_err()
-    {
-        return Err(Error::Pipeline(
-            "audio bundle source rejected seek".to_owned(),
-        ));
-    }
-    pipeline
-        .set_state(gst::State::Playing)
-        .map_err(|error| Error::Pipeline(error.to_string()))?;
-
-    for (track, sink) in sinks {
-        let encoded_track = collect_encoded_track(
-            &pipeline,
-            &sink,
-            request.segment.duration_ns,
-            request.timeout,
-            &request.cancellation,
-        )?;
-        let combined_path = track.output_dir.join("combined.mp4");
-        let segment_request = SegmentRequest {
-            source: request.source.clone(),
-            headers: request.headers.clone(),
-            track: TrackKind::Audio,
-            segment: request.segment.clone(),
-            mode: PipelineMode::Transcode,
-            output_dir: track.output_dir.clone(),
-            timeout: request.timeout,
-            cancellation: request.cancellation.clone(),
-            video_dimensions: None,
-            selected_stream_id: track.stream_id,
-            transmux_video_codec: None,
-            tone_map_hdr: false,
-        };
-        mux_encoded_track(&segment_request, encoded_track, &combined_path)?;
-        let combined = fs::read(&combined_path)?;
-        let (init, media) = split_cmaf(&combined)?;
-        let init_path = track.output_dir.join("init.mp4");
-        let segment_path = track.output_dir.join("segment.m4s");
-        fs::write(&init_path, init)?;
-        fs::write(&segment_path, media)?;
-        let _ = fs::remove_file(combined_path);
-        validate_init_segment(&fs::read(&init_path)?)?;
-        validate_media_segment(&fs::read(&segment_path)?)?;
-        artifacts.push(SegmentArtifact {
-            init_path,
-            segment_path,
-            mode: PipelineMode::Transcode,
-            cached: false,
-        });
-    }
-    let _ = pipeline.set_state(gst::State::Null);
-    Ok(artifacts)
-}
-
-fn valid_cached_segment(init_path: &Path, segment_path: &Path) -> bool {
-    init_path.is_file()
-        && segment_path.is_file()
-        && fs::read(init_path)
-            .ok()
-            .and_then(|data| validate_init_segment(&data).ok())
-            .is_some()
-        && fs::read(segment_path)
-            .ok()
-            .and_then(|data| validate_media_segment(&data).ok())
-            .is_some()
 }
 
 /// Extracts one selected text subtitle interval as a standalone `WebVTT` segment.
@@ -665,6 +447,7 @@ fn generate_segment_once(
                 segment_path,
                 mode: request.mode,
                 cached: true,
+                processing_time_ns: None,
             });
         }
         let _ = fs::remove_file(&init_path);
@@ -733,6 +516,7 @@ fn generate_segment_once(
         request.mode,
         encoder_name,
         request.video_dimensions,
+        request.video_max_fps,
         request.transmux_video_codec,
         request.tone_map_hdr,
     )?;
@@ -834,6 +618,13 @@ fn generate_segment_once(
         request.timeout,
         &request.cancellation,
     );
+    let processing_time_ns = chain.iter().find_map(|element| {
+        let is_tone_mapper = element
+            .factory()
+            .is_some_and(|factory| factory.name() == "hdrtonemap");
+        (is_tone_mapper && element.find_property("processing-time-ns").is_some())
+            .then(|| element.property::<u64>("processing-time-ns"))
+    });
     let _ = pipeline.set_state(gst::State::Null);
     let encoded = encoded?;
     validate_transmux_keyframe(request, &encoded)?;
@@ -852,6 +643,7 @@ fn generate_segment_once(
         segment_path,
         mode: request.mode,
         cached: false,
+        processing_time_ns,
     })
 }
 
@@ -1080,11 +872,13 @@ fn make(name: &str) -> Result<gst::Element> {
         .map_err(|_| Error::MissingElement(name.to_owned()))
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_track_chain(
     track: TrackKind,
     mode: PipelineMode,
     encoder_name: Option<&str>,
     video_dimensions: Option<(u32, u32)>,
+    video_max_fps: Option<u32>,
     transmux_video_codec: Option<VideoCodec>,
     tone_map_hdr: bool,
 ) -> Result<Vec<gst::Element>> {
@@ -1104,7 +898,6 @@ fn build_track_chain(
             let encoder = make(encoder_name.ok_or_else(|| {
                 Error::MissingElement("H.264 encoder was not selected".to_owned())
             })?)?;
-            configure_video_encoder(&encoder);
             let parser = make("h264parse")?;
             parser.set_property("config-interval", -1_i32);
             let output_caps = gst::Caps::builder("video/x-h264")
@@ -1115,6 +908,13 @@ fn build_track_chain(
             let (width, height) = video_dimensions.ok_or_else(|| {
                 Error::Pipeline("video track has no output dimensions".to_owned())
             })?;
+            let max_fps = video_max_fps.ok_or_else(|| {
+                Error::Pipeline("video track has no output frame-rate".to_owned())
+            })?;
+            configure_video_encoder(&encoder, width, height, max_fps);
+            let rate = make("videorate")?;
+            rate.set_property("drop-only", true);
+            rate.set_property("max-rate", i32::try_from(max_fps).unwrap_or(i32::MAX));
             let width = i32::try_from(width).unwrap_or(i32::MAX);
             let height = i32::try_from(height).unwrap_or(i32::MAX);
             let mut chain = if encoder_name.is_some_and(|name| name.starts_with("va"))
@@ -1133,20 +933,35 @@ fn build_track_chain(
                 if tone_map_hdr {
                     raw_caps = raw_caps.field("colorimetry", "bt709");
                 }
-                vec![postprocess, caps_filter(&raw_caps.build())?]
-            } else {
-                let mut raw_caps = gst::Caps::builder("video/x-raw")
+                vec![rate, postprocess, caps_filter(&raw_caps.build())?]
+            } else if tone_map_hdr {
+                let scaled_hdr_caps = gst::Caps::builder("video/x-raw")
                     .field("width", width)
-                    .field("height", height);
-                if tone_map_hdr {
-                    raw_caps = raw_caps
-                        .field("format", "I420")
-                        .field("colorimetry", "bt709");
-                }
+                    .field("height", height)
+                    .build();
+                let sdr_caps = gst::Caps::builder("video/x-raw")
+                    .field("width", width)
+                    .field("height", height)
+                    .field("format", "I420")
+                    .field("colorimetry", "bt709")
+                    .build();
                 vec![
+                    rate,
+                    make("videoscale")?,
+                    caps_filter(&scaled_hdr_caps)?,
+                    make("hdrtonemap")?,
+                    caps_filter(&sdr_caps)?,
+                ]
+            } else {
+                let raw_caps = gst::Caps::builder("video/x-raw")
+                    .field("width", width)
+                    .field("height", height)
+                    .build();
+                vec![
+                    rate,
                     make("videoconvert")?,
                     make("videoscale")?,
-                    caps_filter(&raw_caps.build())?,
+                    caps_filter(&raw_caps)?,
                 ]
             };
             chain.extend([encoder, parser, caps_filter(&output_caps)?]);
@@ -1156,6 +971,7 @@ fn build_track_chain(
             let encoder = make(encoder_name.ok_or_else(|| {
                 Error::MissingElement("AAC encoder was not selected".to_owned())
             })?)?;
+            configure_audio_encoder(&encoder);
             let output_caps = gst::Caps::builder("audio/mpeg")
                 .field("mpegversion", 4_i32)
                 .field("stream-format", "raw")
@@ -1219,21 +1035,68 @@ fn caps_filter(caps: &gst::Caps) -> Result<gst::Element> {
         .map_err(|_| Error::MissingElement("capsfilter".to_owned()))
 }
 
-fn configure_video_encoder(encoder: &gst::Element) {
+fn configure_video_encoder(encoder: &gst::Element, width: u32, height: u32, max_fps: u32) {
+    let factory_name = encoder
+        .factory()
+        .map(|factory| factory.name().to_string())
+        .unwrap_or_default();
+    let bitrate_kbps = target_video_bitrate_kbps(width, height);
+    let target_bitrate_bits = bitrate_kbps.saturating_mul(1_000);
+    let keyframe_interval = max_fps.saturating_mul(4).max(1);
+    match factory_name.as_str() {
+        "x264enc" => {
+            encoder.set_property("bitrate", bitrate_kbps);
+            encoder.set_property_from_str("speed-preset", "veryfast");
+            encoder.set_property_from_str("tune", "zerolatency");
+            encoder.set_property("key-int-max", keyframe_interval);
+            encoder.set_property("bframes", 0_u32);
+        }
+        "openh264enc" => {
+            encoder.set_property("bitrate", target_bitrate_bits);
+            encoder.set_property("gop-size", keyframe_interval);
+            encoder.set_property_from_str("complexity", "low");
+        }
+        _ if factory_name.starts_with("va") => {
+            if encoder.find_property("bitrate").is_some() {
+                encoder.set_property("bitrate", bitrate_kbps);
+            }
+            if encoder.find_property("key-int-max").is_some() {
+                encoder.set_property("key-int-max", keyframe_interval);
+            }
+        }
+        _ if factory_name.starts_with("amc") => {
+            encoder.set_property("bitrate", target_bitrate_bits);
+            encoder.set_property("i-frame-interval", 4_u32);
+        }
+        _ => {}
+    }
+}
+
+pub fn target_video_bitrate_kbps(width: u32, height: u32) -> u32 {
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels >= 3840 * 2160 {
+        20_000
+    } else if pixels >= 2560 * 1440 {
+        12_000
+    } else if pixels >= 1920 * 1080 {
+        8_000
+    } else if pixels >= 1280 * 720 {
+        5_000
+    } else {
+        3_000
+    }
+}
+
+fn configure_audio_encoder(encoder: &gst::Element) {
     let factory_name = encoder
         .factory()
         .map(|factory| factory.name().to_string())
         .unwrap_or_default();
     match factory_name.as_str() {
-        "x264enc" => {
-            encoder.set_property_from_str("speed-preset", "veryfast");
-            encoder.set_property_from_str("tune", "zerolatency");
-            encoder.set_property("key-int-max", 120_u32);
-            encoder.set_property("bframes", 0_u32);
-        }
-        "openh264enc" => {
-            encoder.set_property("gop-size", 120_u32);
-            encoder.set_property_from_str("complexity", "low");
+        "avenc_aac" | "fdkaacenc" | "voaacenc" | "faac"
+            if encoder.find_property("bitrate").is_some() =>
+        {
+            encoder.set_property("bitrate", 192_000_i32);
         }
         _ => {}
     }

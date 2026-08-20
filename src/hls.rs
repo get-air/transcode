@@ -56,19 +56,15 @@ pub fn segment_map(duration_ns: u64, target_duration_ns: u64) -> Vec<SegmentSpec
 
 #[must_use]
 pub fn media_playlist(track: TrackKind, segments: &[SegmentSpec]) -> String {
-    media_playlist_paths(
-        &format!("{}/init.mp4", track.as_str()),
-        &format!("{}/segments", track.as_str()),
-        segments,
-    )
+    media_playlist_paths(&format!("{}/segments", track.as_str()), segments)
 }
 
 #[must_use]
 pub fn indexed_media_playlist(_index: usize, segments: &[SegmentSpec]) -> String {
-    media_playlist_paths("init.mp4", "segments", segments)
+    media_playlist_paths("segments", segments)
 }
 
-fn media_playlist_paths(init_uri: &str, segment_prefix: &str, segments: &[SegmentSpec]) -> String {
+fn media_playlist_paths(segment_prefix: &str, segments: &[SegmentSpec]) -> String {
     let max_duration_ns = segments
         .iter()
         .map(|segment| segment.duration_ns)
@@ -76,15 +72,15 @@ fn media_playlist_paths(init_uri: &str, segment_prefix: &str, segments: &[Segmen
         .unwrap_or(1_000_000_000);
     let target_duration = max_duration_ns.div_ceil(1_000_000_000).max(1);
     let mut output = format!(
-        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MAP:URI=\"{init_uri}\"\n"
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n"
     );
     for segment in segments {
         let seconds = segment.duration_ns / 1_000_000_000;
         let microseconds = segment.duration_ns % 1_000_000_000 / 1_000;
         let _ = write!(
             output,
-            "#EXTINF:{seconds}.{microseconds:06},\n{segment_prefix}/{}\n",
-            segment.sequence
+            "#EXT-X-MAP:URI=\"{segment_prefix}/{}/init.mp4\"\n#EXTINF:{seconds}.{microseconds:06},\n{segment_prefix}/{}\n",
+            segment.sequence, segment.sequence,
         );
     }
     output.push_str("#EXT-X-ENDLIST\n");
@@ -217,7 +213,7 @@ mod tests {
         let playlist = media_playlist(TrackKind::Video, &segment_map(8_500_000_000, 4_000_000_000));
         assert!(playlist.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
         assert!(playlist.contains("#EXT-X-ENDLIST"));
-        assert!(playlist.contains("#EXT-X-MAP:URI=\"video/init.mp4\""));
+        assert!(playlist.contains("#EXT-X-MAP:URI=\"video/segments/1/init.mp4\""));
         assert!(playlist.contains("#EXTINF:0.500000"));
     }
 

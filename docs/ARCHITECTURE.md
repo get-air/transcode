@@ -35,9 +35,11 @@ segment request
 
 H.264 video is transmuxable by default only when it is baseline, constrained-baseline, main, or high profile; 4:2:0; eight-bit; and within the requested dimensions. A client may also declare HEVC or AV1 decoding support; a matching track within the requested dimensions is then parsed and transmuxed without decoding. H.264 and H.265 pass through their codec timestamp reconstructors so reordered Matroska presentation timestamps become valid CMAF decode timestamps. Audio is transmuxable only when it is MPEG-4 AAC with no more than two channels. Otherwise the track is transcoded.
 
-The inspected Stremio server bundle defaults its HLS transmux surface to H.264/AAC. Its H.264 transcode path labels/converts output as BT.709 but does not include a real tone-mapping stage. Air does not treat that metadata rewrite as HDR conversion: HEVC/AV1 passthrough preserves HDR for capable targets. When the active VA driver exposes GStreamer's `hdr-tone-mapping` property and a VA H.264 encoder, Air reports `hdr_tone_mapping: "va"` and keeps the HDR-to-SDR path in hardware. Other runtimes report `"unavailable"` and reject the conversion.
+The inspected Stremio server bundle defaults its HLS transmux surface to H.264/AAC. Its H.264 transcode path labels/converts output as BT.709 but does not include a real tone-mapping stage. Air does not treat that metadata rewrite as HDR conversion: HEVC/AV1 passthrough preserves HDR for capable targets. VA uses the driver's real `hdr-tone-mapping` property. A separately bundled `hdrtonemap` element may provide a real software/OpenCL fallback; Air measures that path against the segment duration and reduces its output height when it loses real-time headroom. Runtimes with neither implementation reject SDR conversion.
 
 Encoder selection is registry-driven rather than operating-system-name-driven. Factories are filtered by output caps, hardware implementations sort first, and each candidate is attempted until one qualifies under the real pipeline. This also finds Android MediaCodec factories whose names are device-specific.
+
+Android MediaCodec factories receive first platform preference. Transcoded H.264 bitrate follows output resolution (3 Mbps below 720p, 5 Mbps at 720p, 8 Mbps at 1080p, 12 Mbps at 1440p, and 20 Mbps at 4K), with a four-second keyframe interval and a 30 fps ceiling. The master playlist advertises the matching estimated bandwidth.
 
 `uridecodebin3` receives the selected discovered stream ID and rejects every other stream in its `select-stream` callback. This prevents multilingual sources from instantiating unused decoders and makes the single video/audio HLS renditions deterministic.
 
@@ -47,11 +49,11 @@ The product has no whole-source download mode. Tests use generated local files (
 
 ## Concurrency and cancellation
 
-A Tokio semaphore bounds native pipelines. A per-session/track/sequence mutex prevents duplicate work. Requests more than two segments away cancel older work for that track; cancellation is checked during preroll, state transitions, encoder fallback, and bus waits. All encoder attempts share one total deadline rather than multiplying the timeout by the number of candidates. HTTP client disconnect detection still needs an explicit job/lease protocol because Hyper can keep the service future alive after the socket closes.
+A Tokio semaphore bounds native pipelines. A per-session/track/sequence mutex prevents duplicate work. Session deletion cancels all generation owned by that session. Cancellation is checked during preroll, state transitions, encoder fallback, and bus waits. All encoder attempts share one total deadline rather than multiplying the timeout by the number of candidates.
 
 Remote GStreamer HTTP sources use bounded blocking-I/O timeouts, one retry, and disabled content compression so range semantics remain predictable. Encoded collection also stops at the requested fragment duration even if a demuxer ignores the seek's stop boundary. Together these keep unhealthy debrid origins and malformed timelines from monopolizing a pipeline permit.
 
-One adjacent segment is scheduled after a short delay only when a permit is idle. Prefetched work is marked so it cannot recursively walk the full title, and active requests always prevent new idle prefetch from starting.
+The selected video and audio renditions begin filling an automatic playback reserve as soon as an HLS session is created. Each foreground segment request advances the reserve by the configured number of seconds. Preload jobs use the same duplicate coalescing and global pipeline limit as foreground work, so clients never need a separate warm call.
 
 ## Cache integrity
 

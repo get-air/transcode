@@ -9,6 +9,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 use tower_http::{
     catch_panic::CatchPanicLayer,
     cors::{Any, CorsLayer},
@@ -34,6 +35,15 @@ pub struct AppState {
     pub capabilities: Capabilities,
     pub sessions: SessionManager,
     pub sources: SourceManager,
+    _lifecycle: Arc<AppLifecycle>,
+}
+
+struct AppLifecycle(CancellationToken);
+
+impl Drop for AppLifecycle {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 impl AppState {
@@ -43,13 +53,19 @@ impl AppState {
     ///
     /// Returns an error when the cache directory cannot be created.
     pub fn new(config: Config) -> Result<Self> {
+        let lifecycle = Arc::new(AppLifecycle(CancellationToken::new()));
         let sources = SourceManager::new(config.clone())?;
-        let sessions = SessionManager::new(config.clone(), sources.clone())?;
+        let sessions = SessionManager::new_with_cancellation(
+            config.clone(),
+            sources.clone(),
+            lifecycle.0.child_token(),
+        )?;
         Ok(Self {
             config,
             capabilities: inspect_capabilities(),
             sessions,
             sources,
+            _lifecycle: lifecycle,
         })
     }
 }
@@ -76,13 +92,23 @@ pub fn app(state: AppState) -> Router {
 pub fn media_app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/v1/sources/{id}/relay", get(source_relay))
         .merge(media_routes())
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
-                .allow_methods([http::Method::GET]),
+                .allow_methods([http::Method::GET])
+                .allow_headers([header::RANGE, header::IF_RANGE])
+                .expose_headers([
+                    header::ACCEPT_RANGES,
+                    header::CONTENT_LENGTH,
+                    header::CONTENT_RANGE,
+                    header::CONTENT_TYPE,
+                    header::ETAG,
+                    header::LAST_MODIFIED,
+                ]),
         )
         .with_state(Arc::new(state))
 }
@@ -105,6 +131,10 @@ fn media_routes() -> Router<Arc<AppState>> {
             get(indexed_audio_segment),
         )
         .route(
+            "/v1/sessions/{id}/audio/{track_index}/segments/{sequence}/init.mp4",
+            get(indexed_audio_segment_init),
+        )
+        .route(
             "/v1/sessions/{id}/subtitles/{track_index}/playlist.m3u8",
             get(indexed_subtitle_media),
         )
@@ -116,6 +146,10 @@ fn media_routes() -> Router<Arc<AppState>> {
         .route(
             "/v1/sessions/{id}/{track}/segments/{sequence}",
             get(segment),
+        )
+        .route(
+            "/v1/sessions/{id}/{track}/segments/{sequence}/init.mp4",
+            get(segment_init),
         )
 }
 
@@ -319,7 +353,7 @@ async fn master(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> Res
         session.has_track(TrackKind::Video),
         &audio,
         &subtitles,
-        8_000_000,
+        session.estimated_bandwidth(),
         codecs.as_deref(),
     );
     Ok(playlist_response(body))
@@ -390,6 +424,16 @@ async fn segment(
     file_response(&artifact.segment_path, "video/iso.segment").await
 }
 
+async fn segment_init(
+    State(state): State<Arc<AppState>>,
+    Path((id, track, sequence)): Path<(Uuid, String, u32)>,
+) -> Result<Response> {
+    let track = parse_track(&track)?;
+    let session = state.sessions.get(id)?;
+    let artifact = state.sessions.segment(session, track, sequence).await?;
+    file_response(&artifact.init_path, "video/mp4").await
+}
+
 async fn indexed_audio_init(
     State(state): State<Arc<AppState>>,
     Path((id, track_index)): Path<(Uuid, usize)>,
@@ -412,6 +456,18 @@ async fn indexed_audio_segment(
         .segment_for(session, TrackKind::Audio, track_index, sequence)
         .await?;
     file_response(&artifact.segment_path, "video/iso.segment").await
+}
+
+async fn indexed_audio_segment_init(
+    State(state): State<Arc<AppState>>,
+    Path((id, track_index, sequence)): Path<(Uuid, usize, u32)>,
+) -> Result<Response> {
+    let session = state.sessions.get(id)?;
+    let artifact = state
+        .sessions
+        .segment_for(session, TrackKind::Audio, track_index, sequence)
+        .await?;
+    file_response(&artifact.init_path, "video/mp4").await
 }
 
 async fn indexed_subtitle_segment(

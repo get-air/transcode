@@ -23,6 +23,16 @@ The script builds the Web-playable codec/plugin surface in
 `AIR_GSTREAMER_RESTRICTED=1` only after reviewing the additional GPL/patent
 licensing obligations; it adds x264/x265, libav, DTS/AC-3, and related plugins.
 
+`androidmedia` is bundled and its MediaCodec factories are the first encoder
+preference. `videorate` enforces the 30 fps output ceiling without copying
+frames unnecessarily. Stock GStreamer does not include a software HDR tone
+mapper on Android: adaptive HDR-to-SDR requires a separately built
+`hdrtonemap` plugin accepting P010/I420 10-bit input and producing real BT.709
+I420. The element must expose a cumulative `processing-time-ns` property so Air
+can adapt resolution from actual tone-mapping cost without mistaking a slow
+origin for a slow device. Until that plugin is packaged, HDR is either preserved for a declared
+target or rejected when conversion would be required.
+
 ## Tauri application integration
 
 Package these files for each Android ABI:
@@ -39,5 +49,6 @@ loopback admin origin; Vizio receives only the tokenized read-only LAN media
 URL.
 
 The current CI gate cross-builds and links arm64/API 24. On-device MediaCodec,
-background-lifecycle, network-security-config, and thermal tests still require
-an Android device or emulator and remain a release qualification gate.
+custom HDR plugin, background-lifecycle, network-security-config, and thermal
+tests still require an Android device or emulator and remain release
+qualification gates.

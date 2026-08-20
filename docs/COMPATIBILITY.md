@@ -12,7 +12,7 @@
 - Opt-in HEVC `hvc1` and validated eight-bit AV1 OBU-stream CMAF passthrough for targets that declare those decoders.
 - AAC-LC raw access units, stereo at most.
 - Explicit RFC 6381 `CODECS` declarations for both direct and transcoded renditions.
-- Explicit target HDR declarations. VA-driver tone mapping is used only when the runtime exposes it; unsupported HDR conversion is rejected and never mislabeled as valid SDR.
+- Explicit target HDR declarations. VA-driver or bundled `hdrtonemap` conversion is used only when the runtime exposes a real implementation; unsupported conversion is rejected and never mislabeled as valid SDR.
 - Complete finite VOD duration and `ENDLIST`.
 - A keyframe at every video fragment boundary.
 - Monotonic `tfdt` across independently generated fragments.
@@ -30,7 +30,7 @@
 - Exact selection between two AAC tracks with different encoded payloads.
 - Runtime switching between two audio and two subtitle renditions without recreating a session.
 - SRT-in-Matroska discovery, key-unit seeking, WebVTT conversion, later-segment timing, subtitle cache reuse, and invalid-index rejection.
-- Idle-only adjacent segment prefetch followed by a verified cache hit.
+- Automatic multi-segment playback reserve followed by verified cache hits.
 - Encoded timestamp duration bounds independent of demuxer end-of-segment behavior.
 - CMAF box structure and decode-time validation.
 - Full master-playlist decode through GStreamer's HLS player.
@@ -68,7 +68,7 @@ Factory discovery is caps-based, so the server does not depend on a hard-coded A
 ## Gates before a stable release
 
 - Exact MP4 and Matroska keyframe handling for opt-in HEVC/AV1 passthrough. Default H.264 already falls back safely per segment.
-- Cross-vendor color-correct Dolby Vision/HDR10/HDR10+ to SDR tone mapping. VA-driver tone mapping is supported when advertised; eight-bit conversion without a real tone mapper is not considered visually correct.
+- Android packaging and qualification of the custom `hdrtonemap` fallback. The scheduler already reduces software tone-mapped output when it misses real-time headroom, but stock GStreamer does not provide this element on Android.
 - Explicit segment job leases so abandoned HTTP requests cancel immediately after a client disconnect.
 - Multiple selectable video/audio/subtitle renditions.
 - Bitmap subtitle support (PGS/VobSub/DVB) through a switchable overlay or OCR path; these are discovered but not advertised as WebVTT.

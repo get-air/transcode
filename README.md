@@ -14,19 +14,20 @@ The server prefers a zero-decode path. H.264/AAC are the conservative defaults; 
   HTTP 429 responses using `Retry-After`.
 - GStreamer discovery for duration, seekability, container, codecs, complete caps, bit depth, colorimetry, HDR signals, dimensions, channels, and language.
 - Complete VOD playlists with a stable duration and `#EXT-X-ENDLIST` from the first request.
-- A session warm endpoint that generates the selected A/V reserve before HLS playback starts.
+- Automatic A/V startup buffering and rolling look-ahead, plus an explicit warm endpoint for clients that must block playback until a requested reserve is ready.
 - HLS v7 CMAF output: independent video/audio init segments and `.m4s` media fragments.
 - Direct H.264/AAC transmuxing when profile, chroma format, bit depth, channel count, and requested dimensions are browser-compatible, with H.264 decode-timestamp reconstruction for reordered Matroska streams.
 - Per-segment keyframe verification: aligned H.264 stays zero-copy, while a long-GOP seek that lands on an older keyframe automatically retries through exact-keyframe H.264 transcoding within the original deadline.
 - Opt-in HEVC and validated eight-bit AV1 CMAF transmux for capable clients, including H.265 DTS reconstruction for Matroska sources. Ten-bit Matroska AV1 takes the conservative H.264 path through a seek-safe `uridecodebin` pipeline because `decodebin3` can abort on real-source AV1 flush seeks.
 - H.264/AAC transcoding with runtime-ranked hardware encoders and automatic fallback.
-- Default 1080p output ceiling without upscaling smaller sources.
+- Resolution-aware H.264 targets from 3 Mbps below 720p through 20 Mbps at 4K, plus 192 kbps AAC.
+- Default 3840×2160 output ceiling, a hard 30 fps cap, and no upscaling of smaller sources.
 - Exact discovered audio/video track selection by index through `uridecodebin3`.
 - Every discovered audio track exposed as an independent HLS rendition for instant player-side language switching.
 - Embedded or external SRT, WebVTT, SSA/ASS, TTML, and related text subtitles normalized to segmented WebVTT renditions for player-side enable/disable and switching.
 - Bounded remote-source I/O timeouts with one retry, preventing a stalled debrid origin from occupying a pipeline indefinitely.
 - Lazy random-access segment generation and immutable segment caching.
-- Idle-only adjacent-segment prefetch so sequential playback usually hits cache.
+- Automatic multi-segment look-ahead for the active video and audio renditions.
 - Correct per-segment `tfdt` offsets across independent seek pipelines.
 - Duplicate-request coalescing, bounded concurrency, far-seek cancellation, session TTLs, and bounded per-session caches.
 - Cache corruption detection and regeneration before serving.
@@ -88,14 +89,15 @@ let host = air_transcode::spawn_tauri_host(
 
 let admin_origin = host.admin_origin();
 let admin_token = host.admin_token();
-let tv_url = host.cast_url(lan_ip, &session.master_url);
+let tv_url = host.cast_url(lan_ip, &session.playback_url);
 ```
 
 Inject `admin_origin` plus `Authorization: Bearer ${admin_token}` into the
 WebView-side `@get-air/transcode` client. The administrative session API remains
 loopback-only and bearer-protected. The LAN listener is read-only and mounted
-beneath a different random per-process token, so the TV can fetch only manifests
-and media for session IDs it receives. `host.shutdown()` stops both listeners.
+beneath a different random per-process token, so the TV can fetch only relayed
+sources, manifests, and media whose opaque IDs it receives. `host.shutdown()`
+stops both listeners.
 
 Register a source. Credentials belong in headers, not in the TV- or browser-facing HLS URL. The server reads the source on demand and never materializes the complete input as a product feature:
 
@@ -125,10 +127,13 @@ curl http://127.0.0.1:11471/v1/sessions \
     },
     "output": {
       "transmux": true,
-      "max_width": 1920,
-      "max_height": 1080,
+      "max_width": 3840,
+      "max_height": 2160,
+      "max_fps": 30,
       "video_codecs": ["h264"],
       "hdr_formats": [],
+      "preferred_audio_languages": ["en", "es"],
+      "preferred_subtitle_languages": ["en"],
       "audio_track_index": 1,
       "subtitle_track_index": 3
     },
@@ -141,7 +146,9 @@ curl http://127.0.0.1:11471/v1/sessions \
   }'
 ```
 
-Play the returned `master_url` with an HLS/MSE player such as hls.js. Its audio and subtitle track lists map directly to the HLS rendition groups, so changing `audioTrack` or `subtitleTrack` does not recreate the server session. Only add `"h265"` or `"av1"` to `video_codecs` after checking the actual browser/device decoder. HDR passthrough preserves the encoded signal. Machines whose VA driver exposes GStreamer's `hdr-tone-mapping` property report `hdr_tone_mapping: "va"`; other complete GStreamer installations report `"basic"` and convert HDR/10-bit input to browser-safe BT.709 H.264 as a compatibility fallback. Hardware decode, scaling, and encode remain preferred (VA on Linux and platform hardware codecs elsewhere); software is the final fallback. Audio renditions are generated independently on demand.
+Open the returned `playback_url`. Browser-compatible remote MP4 is exposed through the authenticated range relay without repackaging; other inputs return the HLS master URL for hls.js or another MSE player. `master_url` remains available when a caller explicitly wants HLS. The client should send its real codec, HDR, resolution, frame-rate, and language capabilities. Audio and subtitle tracks map directly to HLS rendition groups; explicit indexes override preferred-language order. Only add `"h265"` or `"av1"` after checking the actual target decoder. HDR passthrough preserves the encoded signal. HDR-to-SDR conversion is enabled only with VA hardware tone mapping or a real bundled `hdrtonemap` element. Software tone mapping starts at the requested resolution and lowers its height through 1440p, 1080p, and 720p when generation cannot maintain real-time headroom. Metadata relabeling is never presented as tone mapping.
+
+The default per-session cache budget is 4 GiB and can be changed with `--max-cache-bytes` or `AIR_TRANSCODE_MAX_CACHE_BYTES`.
 
 ## Test
 

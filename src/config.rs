@@ -2,6 +2,8 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use clap::Parser;
 
+pub const DEFAULT_MAX_CACHE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 /// Runtime configuration for the transcoding server.
 #[derive(Clone, Debug, Parser)]
 #[command(name = "air-transcode", version, about)]
@@ -30,9 +32,25 @@ pub struct Config {
     #[arg(long, env = "AIR_TRANSCODE_MAX_PIPELINES", default_value_t = 2)]
     pub max_pipelines: usize,
 
+    /// Playback reserve generated automatically ahead of demand.
+    #[arg(long, env = "AIR_TRANSCODE_PRELOAD_SECONDS", default_value_t = 12)]
+    pub preload_seconds: u32,
+
     /// Maximum cached media segments retained per session.
-    #[arg(long, env = "AIR_TRANSCODE_MAX_CACHED_SEGMENTS", default_value_t = 64)]
+    #[arg(
+        long,
+        env = "AIR_TRANSCODE_MAX_CACHED_SEGMENTS",
+        default_value_t = 1024
+    )]
     pub max_cached_segments: usize,
+
+    /// Maximum recoverable cache size for one playback session, in bytes.
+    #[arg(
+        long,
+        env = "AIR_TRANSCODE_MAX_CACHE_BYTES",
+        default_value_t = DEFAULT_MAX_CACHE_BYTES
+    )]
+    pub max_cache_bytes: u64,
 
     /// Inactive session lifetime in seconds.
     #[arg(long, env = "AIR_TRANSCODE_SESSION_TTL_SECONDS", default_value_t = 300)]
@@ -57,7 +75,9 @@ impl Config {
             segment_seconds: 4,
             max_sessions: 16,
             max_pipelines: 2,
-            max_cached_segments: 64,
+            preload_seconds: 12,
+            max_cached_segments: 1024,
+            max_cache_bytes: DEFAULT_MAX_CACHE_BYTES,
             session_ttl_seconds: 300,
             probe_timeout_seconds: 20,
         }
