@@ -64,7 +64,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/sources/{id}/relay", get(source_relay))
         .route("/v1/sessions", post(create_session))
         .route("/v1/sessions/{id}", get(get_session).delete(delete_session))
-        .route("/v1/sessions/{id}/warm-audio", post(warm_audio))
+        .route("/v1/sessions/{id}/warm", post(warm_session))
         .merge(media_routes())
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -268,29 +268,30 @@ async fn delete_session(
 }
 
 #[derive(Deserialize)]
-struct WarmAudioRequest {
+struct WarmSessionRequest {
     position_seconds: f64,
+    buffer_seconds: f64,
 }
 
 #[derive(Serialize)]
-struct WarmAudioResponse {
-    sequence: u32,
+struct WarmSessionResponse {
+    sequences: Vec<u32>,
     elapsed_ms: u64,
 }
 
-async fn warm_audio(
+async fn warm_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
-    Json(request): Json<WarmAudioRequest>,
-) -> Result<Json<WarmAudioResponse>> {
+    Json(request): Json<WarmSessionRequest>,
+) -> Result<Json<WarmSessionResponse>> {
     let session = state.sessions.get(id)?;
     let started = std::time::Instant::now();
-    let sequence = state
+    let sequences = state
         .sessions
-        .warm_audio(session, request.position_seconds)
+        .warm_playback(session, request.position_seconds, request.buffer_seconds)
         .await?;
-    Ok(Json(WarmAudioResponse {
-        sequence,
+    Ok(Json(WarmSessionResponse {
+        sequences,
         elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
     }))
 }

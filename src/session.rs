@@ -63,8 +63,6 @@ pub struct OutputOptions {
     pub transmux: bool,
     #[serde(default)]
     pub force_transcode: bool,
-    #[serde(default = "default_true")]
-    pub video_enabled: bool,
     #[serde(default = "default_max_width")]
     pub max_width: u32,
     #[serde(default = "default_max_height")]
@@ -87,7 +85,6 @@ impl Default for OutputOptions {
         Self {
             transmux: true,
             force_transcode: false,
-            video_enabled: true,
             max_width: default_max_width(),
             max_height: default_max_height(),
             video_track_index: None,
@@ -301,9 +298,6 @@ impl Session {
 
     #[must_use]
     pub fn selected_track(&self, kind: TrackKind) -> Option<&crate::gst::MediaTrack> {
-        if kind == TrackKind::Video && !self.output.video_enabled {
-            return None;
-        }
         let requested_index = match kind {
             TrackKind::Video => self.output.video_track_index,
             TrackKind::Audio => self.output.audio_track_index,
@@ -628,10 +622,7 @@ impl SessionManager {
         }
         let mode = session.mode_for(track, track_index);
         if track == TrackKind::Audio && matches!(mode, PipelineMode::Transcode) {
-            let all_tracks = !session.output.video_enabled;
-            return self
-                .audio_bundle_for(session, track_index, sequence, all_tracks)
-                .await;
+            return self.audio_bundle_for(session, track_index, sequence).await;
         }
         let segment = session
             .segments
@@ -766,7 +757,6 @@ impl SessionManager {
         session: Arc<Session>,
         track_index: usize,
         sequence: u32,
-        all_tracks: bool,
     ) -> Result<SegmentArtifact> {
         let segment = session
             .segments
@@ -808,7 +798,7 @@ impl SessionManager {
         }
         let tracks = session
             .tracks("audio")
-            .filter(|track| all_tracks || track.index == track_index)
+            .filter(|track| track.index == track_index)
             .map(|track| AudioBundleTrack {
                 index: track.index,
                 stream_id: track.stream_id.clone(),
@@ -825,7 +815,7 @@ impl SessionManager {
             headers,
             tracks,
             segment,
-            timeout: Duration::from_secs(if all_tracks { 3 } else { 6 }),
+            timeout: Duration::from_secs(6),
             cancellation: cancellation.clone(),
         };
         let queue_started = Instant::now();
@@ -881,38 +871,47 @@ impl SessionManager {
             })
     }
 
-    /// Warms every audio rendition covering the requested playback position.
+    /// Generates the selected A/V renditions covering an initial playback reserve.
     ///
     /// # Errors
     ///
-    /// Returns an error when the position is outside the timeline or bundled
-    /// audio generation fails.
-    pub async fn warm_audio(&self, session: Arc<Session>, position_seconds: f64) -> Result<u32> {
-        let position_ns = if position_seconds.is_finite() && position_seconds > 0.0 {
-            Duration::from_secs_f64(position_seconds).as_nanos()
-        } else {
-            0
-        };
-        let position_ns = u64::try_from(position_ns).unwrap_or(u64::MAX);
-        let sequence = session
+    /// Returns an error when the position is outside the VOD timeline or a
+    /// selected rendition cannot be generated.
+    pub async fn warm_playback(
+        &self,
+        session: Arc<Session>,
+        position_seconds: f64,
+        buffer_seconds: f64,
+    ) -> Result<Vec<u32>> {
+        let start_ns = seconds_to_ns(position_seconds);
+        let reserve_ns = seconds_to_ns(buffer_seconds.clamp(0.0, 60.0));
+        let end_ns = start_ns.saturating_add(reserve_ns.max(1));
+        let sequences = session
             .segments
             .iter()
-            .find(|segment| {
-                segment.start_ns <= position_ns
-                    && position_ns < segment.start_ns.saturating_add(segment.duration_ns)
+            .filter(|segment| {
+                let segment_end = segment.start_ns.saturating_add(segment.duration_ns);
+                segment.start_ns < end_ns && segment_end > start_ns
             })
-            .or_else(|| session.segments.last())
             .map(|segment| segment.sequence)
-            .ok_or(Error::SegmentOutOfRange { sequence: 0 })?;
-        let track_index = session
-            .tracks("audio")
-            .next()
-            .map(|track| track.index)
-            .ok_or_else(|| Error::TrackNotFound("audio".to_owned()))?;
-        let _ = self
-            .audio_bundle_for(session, track_index, sequence, true)
-            .await?;
-        Ok(sequence)
+            .collect::<Vec<_>>();
+        if sequences.is_empty() {
+            return Err(Error::SegmentOutOfRange { sequence: 0 });
+        }
+        for sequence in &sequences {
+            let jobs = [TrackKind::Video, TrackKind::Audio]
+                .into_iter()
+                .filter_map(|kind| {
+                    session
+                        .selected_track(kind)
+                        .map(|track| (kind, track.index))
+                })
+                .map(|(kind, track_index)| {
+                    self.segment_for(Arc::clone(&session), kind, track_index, *sequence)
+                });
+            futures_util::future::try_join_all(jobs).await?;
+        }
+        Ok(sequences)
     }
 
     /// Generates a `WebVTT` subtitle segment for a discovered text track.
@@ -1111,6 +1110,13 @@ impl SessionManager {
     }
 }
 
+fn seconds_to_ns(value: f64) -> u64 {
+    if !value.is_finite() || value <= 0.0 {
+        return 0;
+    }
+    u64::try_from(Duration::from_secs_f64(value).as_nanos()).unwrap_or(u64::MAX)
+}
+
 pub(crate) fn validate_source(source: &Source) -> Result<()> {
     if !matches!(source.url.scheme(), "http" | "https" | "file") {
         return Err(Error::InvalidSource(format!(
@@ -1195,9 +1201,6 @@ fn validate_hdr_output(
     output: &OutputOptions,
     tone_mapping: HdrToneMapping,
 ) -> Result<()> {
-    if !output.video_enabled {
-        return Ok(());
-    }
     let video = media.tracks.iter().find(|track| {
         track.kind == "video"
             && output

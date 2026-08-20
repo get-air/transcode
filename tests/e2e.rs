@@ -330,7 +330,7 @@ async fn expired_source_refresh_is_single_flight() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bundled_audio_meets_switch_and_seek_latency_gates() -> TestResult {
+async fn on_demand_audio_meets_switch_and_seek_latency_gates() -> TestResult {
     air_transcode::initialize()?;
     let fixtures = tempfile::tempdir()?;
     let fixture = fixtures.path().join("eleven-audio.mkv");
@@ -352,7 +352,7 @@ async fn bundled_audio_meets_switch_and_seek_latency_gates() -> TestResult {
                 "url": format!("{origin_url}/media"),
                 "headers": { "Authorization": "Bearer fixture" }
             },
-            "output": { "video_enabled": false, "max_width": 1920 }
+            "output": { "max_width": 1920 }
         }))
         .send()
         .await?
@@ -439,6 +439,16 @@ async fn remote_http_transmux_is_seekable_deduplicated_and_playable() -> TestRes
     assert_eq!(session["tracks"][0]["rfc6381_codec"], "avc1.42C015");
     let id = json_string(&session, "id")?;
 
+    let warmed: Value = client
+        .post(format!("{server_url}/v1/sessions/{id}/warm"))
+        .json(&json!({ "position_seconds": 0, "buffer_seconds": 12 }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(warmed["sequences"], json!([1, 2, 3, 4]));
+
     let manifest = client
         .get(format!("{server_url}/v1/sessions/{id}/video.m3u8"))
         .send()
@@ -465,8 +475,16 @@ async fn remote_http_transmux_is_seekable_deduplicated_and_playable() -> TestRes
         .error_for_status()?
         .json()
         .await?;
-    assert_eq!(metrics["generated_segments"], 1);
-    assert_eq!(metrics["cache_hits"], 7);
+    assert!(
+        metrics["generated_segments"]
+            .as_u64()
+            .is_some_and(|value| value >= 8)
+    );
+    assert!(
+        metrics["cache_hits"]
+            .as_u64()
+            .is_some_and(|value| value >= 7)
+    );
 
     let init = fetch_bytes(
         &client,

@@ -7,13 +7,14 @@ The server prefers a zero-decode path. H.264/AAC are the conservative defaults; 
 ## Current features
 
 - Authenticated remote HTTP sources with caller-provided headers kept in memory.
-- A tokenized, range-preserving source relay for browser demuxers such as
-  MediaBunny when the upstream media origin does not grant CORS access.
+- A tokenized, range-preserving source relay for browser clients when the
+  upstream media origin does not grant CORS access.
 - Deduplicated source registration resolves redirecting providers once, pins
   the final CDN URL, shares probe metadata across sessions, and circuit-breaks
   HTTP 429 responses using `Retry-After`.
 - GStreamer discovery for duration, seekability, container, codecs, complete caps, bit depth, colorimetry, HDR signals, dimensions, channels, and language.
 - Complete VOD playlists with a stable duration and `#EXT-X-ENDLIST` from the first request.
+- A session warm endpoint that generates the selected A/V reserve before HLS playback starts.
 - HLS v7 CMAF output: independent video/audio init segments and `.m4s` media fragments.
 - Direct H.264/AAC transmuxing when profile, chroma format, bit depth, channel count, and requested dimensions are browser-compatible, with H.264 decode-timestamp reconstruction for reordered Matroska streams.
 - Per-segment keyframe verification: aligned H.264 stays zero-copy, while a long-GOP seek that lands on an older keyframe automatically retries through exact-keyframe H.264 transcoding within the original deadline.
@@ -140,7 +141,7 @@ curl http://127.0.0.1:11471/v1/sessions \
   }'
 ```
 
-Play the returned `master_url` with an HLS/MSE player such as hls.js. Its audio and subtitle track lists map directly to the HLS rendition groups, so changing `audioTrack` or `subtitleTrack` does not recreate the server session. Only add `"h265"` or `"av1"` to `video_codecs` after checking the actual browser/device decoder. HDR passthrough preserves the encoded signal. Machines whose VA driver exposes GStreamer's `hdr-tone-mapping` property report `hdr_tone_mapping: "va"`; other complete GStreamer installations report `"basic"` and convert HDR/10-bit input to browser-safe BT.709 H.264 as a compatibility fallback. Hardware decode, scaling, and encode remain preferred (VA on Linux and platform hardware codecs elsewhere); software is the final fallback. Full-transcode sessions generate only the requested AAC track, while Hybrid warming still prepares every alternate track.
+Play the returned `master_url` with an HLS/MSE player such as hls.js. Its audio and subtitle track lists map directly to the HLS rendition groups, so changing `audioTrack` or `subtitleTrack` does not recreate the server session. Only add `"h265"` or `"av1"` to `video_codecs` after checking the actual browser/device decoder. HDR passthrough preserves the encoded signal. Machines whose VA driver exposes GStreamer's `hdr-tone-mapping` property report `hdr_tone_mapping: "va"`; other complete GStreamer installations report `"basic"` and convert HDR/10-bit input to browser-safe BT.709 H.264 as a compatibility fallback. Hardware decode, scaling, and encode remain preferred (VA on Linux and platform hardware codecs elsewhere); software is the final fallback. Audio renditions are generated independently on demand.
 
 ## Test
 
