@@ -56,56 +56,44 @@ pub fn segment_map(duration_ns: u64, target_duration_ns: u64) -> Vec<SegmentSpec
 
 #[must_use]
 pub fn media_playlist(track: TrackKind, segments: &[SegmentSpec]) -> String {
-    media_playlist_paths(&format!("{}/segments", track.as_str()), segments)
+    let prefix = format!("{}/segments", track.as_str());
+    rendition_playlist(Some(&prefix), segments)
 }
 
 #[must_use]
 pub fn indexed_media_playlist(_index: usize, segments: &[SegmentSpec]) -> String {
-    media_playlist_paths("segments", segments)
-}
-
-fn media_playlist_paths(segment_prefix: &str, segments: &[SegmentSpec]) -> String {
-    let max_duration_ns = segments
-        .iter()
-        .map(|segment| segment.duration_ns)
-        .max()
-        .unwrap_or(1_000_000_000);
-    let target_duration = max_duration_ns.div_ceil(1_000_000_000).max(1);
-    let mut output = format!(
-        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n"
-    );
-    for segment in segments {
-        let seconds = segment.duration_ns / 1_000_000_000;
-        let microseconds = segment.duration_ns % 1_000_000_000 / 1_000;
-        let _ = write!(
-            output,
-            "#EXT-X-MAP:URI=\"{segment_prefix}/{}/init.mp4\"\n#EXTINF:{seconds}.{microseconds:06},\n{segment_prefix}/{}\n",
-            segment.sequence, segment.sequence,
-        );
-    }
-    output.push_str("#EXT-X-ENDLIST\n");
-    output
+    rendition_playlist(Some("segments"), segments)
 }
 
 #[must_use]
 pub fn subtitle_playlist(_index: usize, segments: &[SegmentSpec]) -> String {
+    rendition_playlist(None, segments)
+}
+
+fn rendition_playlist(segment_prefix: Option<&str>, segments: &[SegmentSpec]) -> String {
     let max_duration_ns = segments
         .iter()
         .map(|segment| segment.duration_ns)
         .max()
         .unwrap_or(1_000_000_000);
     let target_duration = max_duration_ns.div_ceil(1_000_000_000).max(1);
+    let independent = segment_prefix.map_or("", |_| "#EXT-X-INDEPENDENT-SEGMENTS\n");
     let mut output = format!(
-        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-PLAYLIST-TYPE:VOD\n"
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-PLAYLIST-TYPE:VOD\n{independent}"
     );
     for segment in segments {
+        if let Some(prefix) = segment_prefix {
+            let _ = writeln!(
+                output,
+                "#EXT-X-MAP:URI=\"{prefix}/{}/init.mp4\"",
+                segment.sequence
+            );
+        }
         let seconds = segment.duration_ns / 1_000_000_000;
         let microseconds = segment.duration_ns % 1_000_000_000 / 1_000;
-        let _ = write!(
-            output,
-            "#EXTINF:{seconds}.{microseconds:06},\nsegments/{}\n",
-            segment.sequence
-        );
+        let _ = writeln!(output, "#EXTINF:{seconds}.{microseconds:06},");
+        let prefix = segment_prefix.unwrap_or("segments");
+        let _ = writeln!(output, "{prefix}/{}", segment.sequence);
     }
     output.push_str("#EXT-X-ENDLIST\n");
     output
@@ -120,35 +108,25 @@ pub fn master_playlist(
     codecs: Option<&str>,
 ) -> String {
     let mut output = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
-    for rendition in audio {
-        let language = rendition
-            .language
-            .as_deref()
-            .map_or_else(String::new, |value| {
-                format!(",LANGUAGE=\"{}\"", hls_attribute(value))
-            });
-        let default = if rendition.default { "YES" } else { "NO" };
-        let _ = writeln!(
-            output,
-            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"{}\"{language},DEFAULT={default},AUTOSELECT=YES,URI=\"audio/{}/playlist.m3u8\"",
-            hls_attribute(&rendition.name),
-            rendition.index
-        );
-    }
-    for rendition in subtitles {
-        let language = rendition
-            .language
-            .as_deref()
-            .map_or_else(String::new, |value| {
-                format!(",LANGUAGE=\"{}\"", hls_attribute(value))
-            });
-        let default = if rendition.default { "YES" } else { "NO" };
-        let _ = writeln!(
-            output,
-            "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subtitles\",NAME=\"{}\"{language},DEFAULT={default},AUTOSELECT=YES,FORCED=NO,URI=\"subtitles/{}/playlist.m3u8\"",
-            hls_attribute(&rendition.name),
-            rendition.index
-        );
+    for (renditions, media_type, group, forced) in [
+        (audio, "AUDIO", "audio", ""),
+        (subtitles, "SUBTITLES", "subtitles", ",FORCED=NO"),
+    ] {
+        for rendition in renditions {
+            let language = rendition
+                .language
+                .as_deref()
+                .map_or_else(String::new, |value| {
+                    format!(",LANGUAGE=\"{}\"", hls_attribute(value))
+                });
+            let default = if rendition.default { "YES" } else { "NO" };
+            let _ = writeln!(
+                output,
+                "#EXT-X-MEDIA:TYPE={media_type},GROUP-ID=\"{group}\",NAME=\"{}\"{language},DEFAULT={default},AUTOSELECT=YES{forced},URI=\"{group}/{}/playlist.m3u8\"",
+                hls_attribute(&rendition.name),
+                rendition.index
+            );
+        }
     }
     if has_video {
         let audio_group = if audio.is_empty() {

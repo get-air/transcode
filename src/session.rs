@@ -176,6 +176,11 @@ pub struct Session {
 impl Session {
     #[must_use]
     pub fn view(&self) -> SessionView {
+        let default_video = self
+            .selected_track(TrackKind::Video)
+            .map(|track| track.index);
+        let default_audio = self.default_track_index("audio");
+        let default_subtitle = self.default_track_index("subtitle");
         let renditions = self
             .media
             .tracks
@@ -183,9 +188,7 @@ impl Session {
             .filter(|track| {
                 track.kind == "audio"
                     || track.kind == "subtitle" && track.web_compatible
-                    || track.kind == "video"
-                        && self.selected_track(TrackKind::Video).map(|item| item.index)
-                            == Some(track.index)
+                    || track.kind == "video" && default_video == Some(track.index)
             })
             .map(|track| {
                 let track_kind = match track.kind.as_str() {
@@ -210,7 +213,12 @@ impl Session {
                     source_track_index: track.index,
                     name: Self::track_name(track),
                     language: track.language.clone(),
-                    default: self.is_default_track(track),
+                    default: match track.kind.as_str() {
+                        "video" => default_video,
+                        "audio" => default_audio,
+                        "subtitle" => default_subtitle,
+                        _ => None,
+                    } == Some(track.index),
                     mode,
                     output_codec,
                     hdr_passthrough: track.kind == "video"
@@ -322,17 +330,18 @@ impl Session {
     pub fn output_codecs(&self) -> Option<String> {
         let mut codecs = Vec::new();
         for kind in [TrackKind::Video, TrackKind::Audio] {
-            if !self.has_track(kind) {
+            let Some(track) = self.selected_track(kind) else {
                 continue;
-            }
-            if matches!(self.mode(kind), PipelineMode::Transcode) {
-                codecs.push(match kind {
-                    TrackKind::Video => "avc1.640028".to_owned(),
-                    TrackKind::Audio => "mp4a.40.2".to_owned(),
-                });
-                continue;
-            }
-            codecs.push(self.selected_track(kind)?.rfc6381_codec.clone()?);
+            };
+            let codec = if matches!(self.mode_for(kind, track.index), PipelineMode::Transcode) {
+                match kind {
+                    TrackKind::Video => "avc1.640028",
+                    TrackKind::Audio => "mp4a.40.2",
+                }
+            } else {
+                track.rfc6381_codec.as_deref()?
+            };
+            codecs.push(codec);
         }
         (!codecs.is_empty()).then(|| codecs.join(","))
     }
@@ -424,10 +433,6 @@ impl Session {
                 })
                 .map(|track| track.index)
         })
-    }
-
-    fn is_default_track(&self, track: &crate::gst::MediaTrack) -> bool {
-        self.default_track_index(&track.kind) == Some(track.index)
     }
 
     fn track_name(track: &crate::gst::MediaTrack) -> String {

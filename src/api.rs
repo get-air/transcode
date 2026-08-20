@@ -124,15 +124,15 @@ fn media_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/v1/sessions/{id}/audio/{track_index}/init.mp4",
-            get(indexed_audio_init),
+            get(artifact_init),
         )
         .route(
             "/v1/sessions/{id}/audio/{track_index}/segments/{sequence}",
-            get(indexed_audio_segment),
+            get(artifact_segment),
         )
         .route(
             "/v1/sessions/{id}/audio/{track_index}/segments/{sequence}/init.mp4",
-            get(indexed_audio_segment_init),
+            get(artifact_init),
         )
         .route(
             "/v1/sessions/{id}/subtitles/{track_index}/playlist.m3u8",
@@ -142,14 +142,14 @@ fn media_routes() -> Router<Arc<AppState>> {
             "/v1/sessions/{id}/subtitles/{track_index}/segments/{sequence}",
             get(indexed_subtitle_segment),
         )
-        .route("/v1/sessions/{id}/{track}/init.mp4", get(init))
+        .route("/v1/sessions/{id}/{track}/init.mp4", get(artifact_init))
         .route(
             "/v1/sessions/{id}/{track}/segments/{sequence}",
-            get(segment),
+            get(artifact_segment),
         )
         .route(
             "/v1/sessions/{id}/{track}/segments/{sequence}/init.mp4",
-            get(segment_init),
+            get(artifact_init),
         )
 }
 
@@ -404,101 +404,60 @@ fn render_media(state: &AppState, id: Uuid, track: TrackKind) -> Result<Response
     Ok(playlist_response(media_playlist(track, &session.segments)))
 }
 
-async fn init(
-    State(state): State<Arc<AppState>>,
-    Path((id, track)): Path<(Uuid, String)>,
-) -> Result<Response> {
-    let track = parse_track(&track)?;
-    let session = state.sessions.get(id)?;
-    let artifact = state
-        .sessions
-        .segment(Arc::clone(&session), track, 1)
-        .await?;
-    artifact_response(&state, &session, &artifact.init_path, "video/mp4").await
+#[derive(Deserialize)]
+struct ArtifactPath {
+    id: Uuid,
+    track: Option<String>,
+    track_index: Option<usize>,
+    sequence: Option<u32>,
 }
 
-async fn segment(
+async fn artifact_init(
     State(state): State<Arc<AppState>>,
-    Path((id, track, sequence)): Path<(Uuid, String, u32)>,
+    Path(path): Path<ArtifactPath>,
 ) -> Result<Response> {
-    let track = parse_track(&track)?;
-    let session = state.sessions.get(id)?;
-    let artifact = state
-        .sessions
-        .segment(Arc::clone(&session), track, sequence)
-        .await?;
-    artifact_response(
-        &state,
-        &session,
-        &artifact.segment_path,
-        "video/iso.segment",
-    )
-    .await
+    media_artifact(&state, path, ArtifactPart::Init).await
 }
 
-async fn segment_init(
+async fn artifact_segment(
     State(state): State<Arc<AppState>>,
-    Path((id, track, sequence)): Path<(Uuid, String, u32)>,
+    Path(path): Path<ArtifactPath>,
 ) -> Result<Response> {
-    let track = parse_track(&track)?;
-    let session = state.sessions.get(id)?;
-    let artifact = state
-        .sessions
-        .segment(Arc::clone(&session), track, sequence)
-        .await?;
-    artifact_response(&state, &session, &artifact.init_path, "video/mp4").await
+    media_artifact(&state, path, ArtifactPart::Segment).await
 }
 
-async fn indexed_audio_init(
-    State(state): State<Arc<AppState>>,
-    Path((id, track_index)): Path<(Uuid, usize)>,
-) -> Result<Response> {
-    let session = state.sessions.get(id)?;
-    let artifact = state
-        .sessions
-        .segment_for(Arc::clone(&session), TrackKind::Audio, track_index, 1)
-        .await?;
-    artifact_response(&state, &session, &artifact.init_path, "video/mp4").await
+enum ArtifactPart {
+    Init,
+    Segment,
 }
 
-async fn indexed_audio_segment(
-    State(state): State<Arc<AppState>>,
-    Path((id, track_index, sequence)): Path<(Uuid, usize, u32)>,
+async fn media_artifact(
+    state: &AppState,
+    path: ArtifactPath,
+    part: ArtifactPart,
 ) -> Result<Response> {
-    let session = state.sessions.get(id)?;
-    let artifact = state
-        .sessions
-        .segment_for(
-            Arc::clone(&session),
-            TrackKind::Audio,
-            track_index,
-            sequence,
-        )
-        .await?;
-    artifact_response(
-        &state,
-        &session,
-        &artifact.segment_path,
-        "video/iso.segment",
-    )
-    .await
-}
-
-async fn indexed_audio_segment_init(
-    State(state): State<Arc<AppState>>,
-    Path((id, track_index, sequence)): Path<(Uuid, usize, u32)>,
-) -> Result<Response> {
-    let session = state.sessions.get(id)?;
-    let artifact = state
-        .sessions
-        .segment_for(
-            Arc::clone(&session),
-            TrackKind::Audio,
-            track_index,
-            sequence,
-        )
-        .await?;
-    artifact_response(&state, &session, &artifact.init_path, "video/mp4").await
+    let track = path
+        .track
+        .as_deref()
+        .map_or(Ok(TrackKind::Audio), parse_track)?;
+    let session = state.sessions.get(path.id)?;
+    let sequence = path.sequence.unwrap_or(1);
+    let artifact = if let Some(track_index) = path.track_index {
+        state
+            .sessions
+            .segment_for(Arc::clone(&session), track, track_index, sequence)
+            .await?
+    } else {
+        state
+            .sessions
+            .segment(Arc::clone(&session), track, sequence)
+            .await?
+    };
+    let (path, content_type) = match part {
+        ArtifactPart::Init => (&artifact.init_path, "video/mp4"),
+        ArtifactPart::Segment => (&artifact.segment_path, "video/iso.segment"),
+    };
+    artifact_response(state, &session, path, content_type).await
 }
 
 async fn indexed_subtitle_segment(

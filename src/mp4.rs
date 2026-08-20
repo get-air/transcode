@@ -14,16 +14,20 @@ struct BoxHeader {
     end: usize,
 }
 
+#[derive(Default)]
+struct BoxSummary {
+    required: u8,
+    media_start: Option<usize>,
+    media_data: Option<(usize, usize)>,
+}
+
 /// Validates the required top-level boxes in a CMAF initialization segment.
 ///
 /// # Errors
 ///
 /// Returns an error for truncated boxes or missing `ftyp`/`moov` boxes.
 pub fn validate_init_segment(data: &[u8]) -> Result<()> {
-    let boxes = top_level_boxes(data)?;
-    let has_ftyp = boxes.iter().any(|header| header.kind == *b"ftyp");
-    let has_moov = boxes.iter().any(|header| header.kind == *b"moov");
-    if has_ftyp && has_moov {
+    if top_level_boxes(data)?.required & 3 == 3 {
         Ok(())
     } else {
         Err(Error::Pipeline(
@@ -39,11 +43,7 @@ pub fn validate_init_segment(data: &[u8]) -> Result<()> {
 /// Returns an error for truncated boxes or missing `styp`, `moof`, `tfdt`, or
 /// `mdat` boxes.
 pub fn validate_media_segment(data: &[u8]) -> Result<()> {
-    let boxes = top_level_boxes(data)?;
-    let has_styp = boxes.iter().any(|header| header.kind == *b"styp");
-    let has_moof = boxes.iter().any(|header| header.kind == *b"moof");
-    let has_mdat = boxes.iter().any(|header| header.kind == *b"mdat");
-    if has_styp && has_moof && has_mdat && decode_time(data).is_some() {
+    if top_level_boxes(data)?.required & 0b1_1100 == 0b1_1100 && decode_time(data).is_some() {
         Ok(())
     } else {
         Err(Error::Pipeline(
@@ -61,11 +61,8 @@ pub fn decode_time(data: &[u8]) -> Option<u64> {
 /// Returns the media payload from the first top-level `mdat` box.
 #[must_use]
 pub fn media_data(data: &[u8]) -> Option<&[u8]> {
-    top_level_boxes(data)
-        .ok()?
-        .into_iter()
-        .find(|header| header.kind == *b"mdat")
-        .and_then(|header| data.get(header.payload_start..header.end))
+    let (start, end) = top_level_boxes(data).ok()?.media_data?;
+    data.get(start..end)
 }
 
 /// Splits a complete CMAF file into its initialization and media sections.
@@ -75,11 +72,8 @@ pub fn media_data(data: &[u8]) -> Option<&[u8]> {
 /// Returns an error when the file is malformed or does not contain a media
 /// section beginning with `styp` or `moof`.
 pub fn split_cmaf(data: &[u8]) -> Result<(&[u8], &[u8])> {
-    let boxes = top_level_boxes(data)?;
-    let media_start = boxes
-        .iter()
-        .find(|header| matches!(&header.kind, b"styp" | b"moof"))
-        .map(|header| header.start)
+    let media_start = top_level_boxes(data)?
+        .media_start
         .ok_or_else(|| Error::Pipeline("generated CMAF file has no media section".to_owned()))?;
     let init = data
         .get(..media_start)
@@ -123,15 +117,33 @@ fn find_tfdt(data: &[u8], start: usize, end: usize, depth: u8) -> Option<u64> {
     None
 }
 
-fn top_level_boxes(data: &[u8]) -> Result<Vec<BoxHeader>> {
-    let mut boxes = Vec::new();
+fn top_level_boxes(data: &[u8]) -> Result<BoxSummary> {
+    let mut summary = BoxSummary::default();
     let mut cursor = 0;
     while cursor < data.len() {
         let header = parse_header(data, cursor, data.len()).map_err(Error::Pipeline)?;
         cursor = header.end;
-        boxes.push(header);
+        match &header.kind {
+            b"ftyp" => summary.required |= 1,
+            b"moov" => summary.required |= 2,
+            b"styp" => {
+                summary.required |= 4;
+                summary.media_start.get_or_insert(header.start);
+            }
+            b"moof" => {
+                summary.required |= 8;
+                summary.media_start.get_or_insert(header.start);
+            }
+            b"mdat" => {
+                summary.required |= 16;
+                summary
+                    .media_data
+                    .get_or_insert((header.payload_start, header.end));
+            }
+            _ => {}
+        }
     }
-    Ok(boxes)
+    Ok(summary)
 }
 
 fn parse_header(data: &[u8], start: usize, limit: usize) -> std::result::Result<BoxHeader, String> {

@@ -253,10 +253,7 @@ impl SourceManager {
         };
         if source.references.load(Ordering::Acquire) == 0 {
             self.sources.remove(&id);
-            self.fingerprints
-                .remove(&source_fingerprint(&source.original));
-            self.registration_locks
-                .remove(&source_fingerprint(&source.original));
+            self.remove_indexes(&source);
         } else {
             source.touch();
         }
@@ -275,7 +272,6 @@ impl SourceManager {
             source.references.store(0, Ordering::Release);
             return Err(Error::Task("source reference count underflow".to_owned()));
         }
-        source.touch();
         Ok(())
     }
 
@@ -299,7 +295,7 @@ impl SourceManager {
                 .cdn_range_requests
                 .fetch_add(1, Ordering::Relaxed);
         }
-        let attempted_url = source.resolved().0;
+        let attempted_url = source.resolved.read().url.clone();
         let response = self
             .send_resolved(source, method.clone(), range, if_range)
             .await?;
@@ -312,7 +308,8 @@ impl SourceManager {
 
         let _refresh_guard = source.refresh.lock().await;
         Self::assert_not_rate_limited(source)?;
-        if source.resolved().0 == attempted_url {
+        let endpoint_is_stale = source.resolved.read().url == attempted_url;
+        if endpoint_is_stale {
             let refreshed = self.resolve(&source.original).await?;
             *source.resolved.write() = refreshed;
             self.metrics.refreshes.fetch_add(1, Ordering::Relaxed);
@@ -394,11 +391,15 @@ impl SourceManager {
         range: Option<&str>,
         if_range: Option<&str>,
     ) -> Result<Response> {
-        let (url, headers) = source.resolved();
-        let mut request = self.client.request(method, url);
-        for (name, value) in headers {
-            request = request.header(name, value);
-        }
+        let mut request = {
+            let resolved = source.resolved.read();
+            let mut request = self.client.request(method, resolved.url.clone());
+            for (name, value) in &resolved.headers {
+                request = request.header(name, value);
+            }
+            drop(resolved);
+            request
+        };
         if let Some(range) = range {
             request = request.header(header::RANGE, range);
         }
@@ -458,10 +459,7 @@ impl SourceManager {
             .collect::<Vec<_>>();
         for id in expired {
             if let Some((_, source)) = self.sources.remove(&id) {
-                self.fingerprints
-                    .remove(&source_fingerprint(&source.original));
-                self.registration_locks
-                    .remove(&source_fingerprint(&source.original));
+                self.remove_indexes(&source);
             }
         }
     }
@@ -479,11 +477,14 @@ impl SourceManager {
         if let Some(id) = oldest
             && let Some((_, source)) = self.sources.remove(&id)
         {
-            self.fingerprints
-                .remove(&source_fingerprint(&source.original));
-            self.registration_locks
-                .remove(&source_fingerprint(&source.original));
+            self.remove_indexes(&source);
         }
+    }
+
+    fn remove_indexes(&self, source: &RegisteredSource) {
+        let fingerprint = source_fingerprint(&source.original);
+        self.fingerprints.remove(&fingerprint);
+        self.registration_locks.remove(&fingerprint);
     }
 }
 
