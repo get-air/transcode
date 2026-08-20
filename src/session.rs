@@ -1140,7 +1140,7 @@ impl SessionManager {
                         }
                     })
                     .filter_map(|entry| {
-                        let modified = entry.metadata().ok()?.modified().ok()?;
+                        let modified = cache_entry_modified(&entry.path())?;
                         Some((modified, entry.path()))
                     })
                     .collect::<Vec<_>>();
@@ -1149,7 +1149,14 @@ impl SessionManager {
                 }
                 entries.sort_by_key(|(modified, _)| *modified);
                 let remove_count = entries.len() - limit;
-                for (_, path) in entries.into_iter().take(remove_count) {
+                let recent_cutoff = std::time::SystemTime::now()
+                    .checked_sub(Duration::from_secs(2))
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                for (_, path) in entries
+                    .into_iter()
+                    .filter(|(modified, _)| *modified < recent_cutoff)
+                    .take(remove_count)
+                {
                     if path.is_dir() {
                         std::fs::remove_dir_all(path)?;
                     } else {
@@ -1180,15 +1187,33 @@ fn enforce_cache_byte_budget(root: &std::path::Path, limit: u64) -> Result<()> {
         return Ok(());
     }
     files.sort_by_key(|(modified, _, _)| *modified);
-    for (_, size, path) in files {
+    let recent_cutoff = std::time::SystemTime::now()
+        .checked_sub(Duration::from_secs(2))
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    for (modified, size, path) in files {
         if total <= limit {
             break;
+        }
+        if modified >= recent_cutoff {
+            continue;
         }
         if std::fs::remove_file(path).is_ok() {
             total = total.saturating_sub(size);
         }
     }
     Ok(())
+}
+
+fn cache_entry_modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    if path.is_file() {
+        return path.metadata().ok()?.modified().ok();
+    }
+    std::fs::read_dir(path)
+        .ok()?
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| entry.metadata().ok()?.modified().ok())
+        .max()
+        .or_else(|| path.metadata().ok()?.modified().ok())
 }
 
 fn collect_cache_files(
