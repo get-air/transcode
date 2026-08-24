@@ -154,7 +154,7 @@ jobs:
           GSTREAMER_ROOT_ANDROID: ${{ github.workspace }}/.ci/gstreamer-android
         run: ./scripts/build-android.sh
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: air-transcode-android-arm64
           retention-days: 7
